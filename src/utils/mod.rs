@@ -1,5 +1,6 @@
 pub mod codec;
 
+#[derive(Debug)]
 pub struct Entry {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
