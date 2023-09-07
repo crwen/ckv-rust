@@ -1,4 +1,6 @@
 pub mod codec;
+pub mod convert;
+pub mod file;
 
 #[derive(Debug)]
 pub struct Entry {

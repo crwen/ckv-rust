@@ -28,4 +28,8 @@ impl Block {
     pub fn calculate_checksum(&self) -> u64 {
         calculate_checksum(&self.data)
     }
+
+    pub fn data(&self) -> &Vec<u8> {
+        &self.data
+    }
 }

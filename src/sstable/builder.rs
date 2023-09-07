@@ -1,6 +1,11 @@
 use bytes::BufMut;
 
-use crate::utils::{codec::encode_varintu32, convert::u32vec_to_bytes, Entry};
+use crate::utils::{
+    codec::encode_varintu32,
+    convert::u32vec_to_bytes,
+    file::{FileOptions, WriteableFile},
+    Entry,
+};
 
 use super::block::{Block, SIZEOF_U32};
 
@@ -10,17 +15,19 @@ pub struct TableBuilder {
     curr_block: Block,
     entry_offsets: Vec<u32>,
     offset: u32,
-    block_size: usize,
+    file_opt: FileOptions,
+    file: Box<dyn WriteableFile>,
 }
 
 impl TableBuilder {
-    pub fn new(block_size: usize) -> Self {
+    pub fn new(file_opt: FileOptions, file: Box<dyn WriteableFile>) -> Self {
         TableBuilder {
             blocks: Vec::new(),
             curr_block: Block::new(),
             entry_offsets: Vec::new(),
             offset: 0,
-            block_size,
+            file_opt,
+            file,
         }
     }
 
@@ -53,13 +60,13 @@ impl TableBuilder {
             + self.entry_offsets.len() * SIZEOF_U32
             + expected_len
             + 12
-            < self.block_size
+            < self.file_opt.block_size()
         {
             return;
         }
 
         self.finish_block();
-        // TODO: Flush
+        self.file.flush().unwrap();
     }
 
     /// finishBlock write other info to Block, e.g. entry offsets, checksum
@@ -78,7 +85,37 @@ impl TableBuilder {
             .append(&self.curr_block.calculate_checksum().to_be_bytes());
         // switch blocks
         let block = std::mem::replace(&mut self.curr_block, Block::new());
+        self.file.append(block.data()).unwrap();
         self.blocks.push(block);
         self.entry_offsets = Vec::new();
+    }
+}
+
+#[cfg(test)]
+mod buildtest {
+    use std::path::Path;
+
+    use crate::utils::{
+        file::{FileOptions, WritableFileImpl},
+        Entry,
+    };
+
+    use super::TableBuilder;
+
+    #[test]
+    fn test_write() {
+        let mut tb = TableBuilder::new(
+            FileOptions { block_size: 4096 },
+            Box::new(WritableFileImpl::new(Path::new("0001.sst"))),
+        );
+        for i in 0..1000 {
+            let e = Entry::new(
+                (i as u32).to_be_bytes().to_vec(),
+                (i as u32).to_be_bytes().to_vec(),
+                i,
+            );
+            tb.add(e);
+        }
+        tb.finish_block();
     }
 }
