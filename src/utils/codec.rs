@@ -5,6 +5,8 @@ use bytes::BufMut;
 pub enum CodecError {
     #[error("invalid varint: {0}")]
     InvalidVarint(String),
+    #[error("Checksum not match: expected {0}, found {1}")]
+    ChecksumNotMatch(u64, u64),
 }
 
 pub fn varintu32_length(v: u32) -> u32 {
@@ -46,6 +48,18 @@ pub fn decode_varintu32(buf: &[u8]) -> Result<u32, CodecError> {
         }
     }
     Ok(v)
+}
+
+pub fn calculate_checksum(data: &[u8]) -> u64 {
+    crc32fast::hash(data) as u64
+}
+pub fn verify_checksum(data: &[u8], expected: u64) -> Result<(), CodecError> {
+    let checksum = calculate_checksum(data);
+
+    if checksum != expected {
+        return Err(CodecError::ChecksumNotMatch(expected, checksum));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
