@@ -63,7 +63,7 @@ pub fn verify_checksum(data: &[u8], expected: u64) -> Result<(), CodecError> {
 }
 
 #[cfg(test)]
-mod tests {
+mod codec_tests {
 
     use crate::utils::codec::{decode_varintu32, encode_varintu32};
 

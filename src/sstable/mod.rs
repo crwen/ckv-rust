@@ -1,3 +1,4 @@
 mod block;
-pub mod builder;
+mod block_builder;
 mod table;
+pub mod table_builder;
