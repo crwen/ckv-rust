@@ -1,4 +1,9 @@
-use crate::utils::file::{FileOptions, WriteableFile};
+use std::path::Path;
+
+use crate::utils::{
+    file::{FileOptions, WritableFileImpl, WriteableFile},
+    Entry,
+};
 
 use super::{block::BlockHandler, block_builder::BlockBuilder};
 
@@ -30,6 +35,18 @@ impl TableBuilder {
             last_key: Vec::new(),
             pending_index_entry: false,
         }
+    }
+
+    pub fn build_table<T>(dbname: &str, opt: FileOptions, iter: T)
+    where
+        T: Iterator<Item = Entry>,
+    {
+        let mut tb = TableBuilder::new(opt, Box::new(WritableFileImpl::new(Path::new(dbname))));
+
+        iter.for_each(|e| tb.add(&e.key, &e.value));
+
+        tb.finish();
+        tb.file.sync().unwrap();
     }
 
     /// TODO: prefix compaction
@@ -99,30 +116,30 @@ mod builder_test {
     use bytes::Buf;
 
     use crate::{
+        mem_table::{MemTable, MemTableIterator},
         sstable::block::{Block, BLOCK_TRAILER_SIZE_},
-        utils::{
-            file::{FileOptions, WritableFileImpl},
-            Entry,
-        },
+        utils::{file::FileOptions, Entry},
     };
 
     use super::TableBuilder;
 
     #[test]
-    fn test_write() {
-        let mut tb = TableBuilder::new(
-            FileOptions { block_size: 4096 },
-            Box::new(WritableFileImpl::new(Path::new("builder.sst"))),
-        );
+    fn builder_test() {
+        let mem = MemTable::new();
         for i in 0..1000 {
             let e = Entry::new(
                 (i as u32).to_be_bytes().to_vec(),
                 (i as u32).to_be_bytes().to_vec(),
                 i,
             );
-            tb.add(&e.key, &e.value);
+            mem.set(e);
         }
-        tb.finish();
+        TableBuilder::build_table(
+            "builder.sst",
+            FileOptions { block_size: 4096 },
+            MemTableIterator::new(&mem),
+        );
+        let mut mem_iter = MemTableIterator::new(&mem);
 
         let mut file = std::fs::File::open(Path::new("builder.sst")).unwrap();
         let mut buf = Vec::new();
@@ -150,7 +167,8 @@ mod builder_test {
             let mut lkey: Vec<u8> = Vec::new();
             let iter = data_block.into_iter();
             iter.for_each(|e| {
-                let expected_key = i.to_be_bytes();
+                let mem_entry = mem_iter.next().unwrap();
+                let expected_key = mem_entry.key;
                 let expected_value = i.to_be_bytes();
                 assert_eq!(e.key, expected_key);
                 assert_eq!(e.value, expected_value);

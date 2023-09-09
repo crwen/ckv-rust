@@ -40,7 +40,8 @@ impl Table {
     pub fn internal_get(&self, internal_key: &[u8]) -> Option<Entry> {
         // find data block first
         let mut index_iter = BlockIterator::new(Arc::new(self.index_block.clone()));
-        let e = index_iter.seek(internal_key).unwrap();
+        let res = index_iter.seek(internal_key);
+        let e = res.as_ref()?;
         let handler = BlockHandler::decode(e.value()).unwrap();
 
         // find in data block
@@ -115,59 +116,45 @@ impl Iterator for TableIterator {
 mod table_test {
     use std::path::Path;
 
-    use bytes::BufMut;
-
     use crate::{
+        mem_table::{MemTable, MemTableIterator},
         sstable::{table::Table, table_builder::TableBuilder},
         utils::{
-            codec::encode_varintu32,
-            file::{FileOptions, RandomAccessFileImpl, WritableFileImpl},
+            file::{FileOptions, RandomAccessFileImpl},
             Entry,
         },
     };
 
-    fn build_internal_key(entry: &Entry, typ: u8) -> Vec<u8> {
-        let key = entry.key();
-        let seq = entry.seq();
-        let key_sz = key.len() as u32;
-        let mut internal_key = vec![];
-
-        encode_varintu32(&mut internal_key, key_sz);
-
-        internal_key.put_slice(key);
-        internal_key.put_u64((seq << 8) | typ as u64);
-
-        internal_key
-    }
     #[test]
     fn table_seek_test() {
-        let mut tb = TableBuilder::new(
-            FileOptions { block_size: 4096 },
-            Box::new(WritableFileImpl::new(Path::new("table.sst"))),
-        );
+        let mem = MemTable::new();
         for i in 0..1000 {
-            let mut e = Entry::new(
+            let e = Entry::new(
                 (i as u32).to_be_bytes().to_vec(),
                 (i as u32).to_be_bytes().to_vec(),
                 i,
             );
-            e.key = build_internal_key(&e, 0);
-            tb.add(&e.key, &e.value);
+            mem.set(e);
         }
-        tb.finish();
+        let mut mem_iter = MemTableIterator::new(&mem);
+        TableBuilder::build_table(
+            "table.sst",
+            FileOptions { block_size: 4096 },
+            MemTableIterator::new(&mem),
+        );
         let t = Table::new(
             FileOptions { block_size: 4096 },
             Box::new(RandomAccessFileImpl::open(Path::new("table.sst"))),
         )
         .unwrap();
 
-        for i in 0..300 {
-            let k: u32 = i as u32;
-            let e = Entry::new(k.to_be_bytes().to_vec(), k.to_be_bytes().to_vec(), i);
-
-            let ikey = build_internal_key(&e, 0);
-            let res = t.internal_get(&ikey).unwrap();
-            assert_eq!(res.key(), &ikey.to_vec());
+        for _ in 0..300 {
+            let e = mem_iter.next().unwrap();
+            let ikey = e.key;
+            println!("{:?}", ikey);
+            let res = t.internal_get(&ikey);
+            assert!(res.is_some());
+            assert_eq!(res.unwrap().key(), &ikey.to_vec());
         }
     }
 }

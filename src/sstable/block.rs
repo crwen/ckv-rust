@@ -2,12 +2,9 @@ use std::sync::Arc;
 
 use bytes::{Buf, BufMut};
 
-use crate::{
-    mem_table::Key,
-    utils::{
-        codec::{decode_varintu32, varintu32_length, verify_checksum},
-        Entry,
-    },
+use crate::utils::{
+    codec::{decode_varintu32, varintu32_length, verify_checksum},
+    Entry,
 };
 
 use super::{Result, TableError};
@@ -150,14 +147,15 @@ impl BlockIterator {
     pub fn seek(&mut self, key: &[u8]) -> Option<Entry> {
         // self.block.
         let (mut low, mut high) = (0, self.block.entry_offsets.len() - 1);
-        let target_key = Key::new(key.to_vec());
+        // let target_key = Key::new(key.to_vec());
         while low < high {
             let mid = ((high - low) >> 1) + low;
             let offset = self.block.entry_offsets[mid];
             let entry = self.block.read_entry_at(offset as usize).unwrap();
+            // println!("ekey{}, target {}, low {}, mid {}, high {}", e.key, )
             // TODO: compare
-            let entry_key = Key::new(entry.key);
-            if entry_key >= target_key {
+
+            if BlockIterator::greater_or_equal(&entry.key, key) {
                 high = mid;
             } else {
                 low = mid + 1;
@@ -168,9 +166,35 @@ impl BlockIterator {
         self.seek_to(low)
     }
 
-    // fn decode_entry() {
-    //
+    // fn less_or_equal(key: &[u8], target: &[u8]) -> bool {
+    //     let user_key1 = &key[..key.len() - 8];
+    //     let user_key2 = &target[..target.len() - 8];
+    //     // user_key1.
+    //     match user_key1.cmp(user_key2) {
+    //         std::cmp::Ordering::Less => true,
+    //         std::cmp::Ordering::Greater => false,
+    //         std::cmp::Ordering::Equal => {
+    //             let seq1 = (&key[key.len() - 8..]).get_u64() >> 8;
+    //             let seq2 = (&target[target.len() - 8..]).get_u64() >> 8;
+    //             seq1 <= seq2
+    //         }
+    //     }
     // }
+
+    fn greater_or_equal(key: &[u8], target: &[u8]) -> bool {
+        let user_key1 = &key[..key.len() - 8];
+        let user_key2 = &target[..target.len() - 8];
+        // user_key1.
+        match user_key1.cmp(user_key2) {
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => {
+                let seq1 = (&key[key.len() - 8..]).get_u64() >> 8;
+                let seq2 = (&target[target.len() - 8..]).get_u64() >> 8;
+                seq1 >= seq2
+            }
+        }
+    }
 }
 
 impl Iterator for BlockIterator {
@@ -187,50 +211,36 @@ impl Iterator for BlockIterator {
 mod block_test {
     use std::{io::Read, path::Path, sync::Arc};
 
-    use bytes::{Buf, BufMut};
+    use bytes::Buf;
 
     use crate::{
+        mem_table::{MemTable, MemTableIterator},
         sstable::table_builder::TableBuilder,
-        utils::{
-            file::{FileOptions, WritableFileImpl},
-            Entry,
-        },
+        utils::{file::FileOptions, Entry},
     };
 
     use super::{Block, BlockIterator};
 
-    fn build_internal_key(entry: &Entry, typ: u8) -> Vec<u8> {
-        let key = entry.key();
-        let seq = entry.seq();
-        // let key_sz = key.len() as u32;
-        let mut internal_key = vec![];
-
-        // encode_varintu32(&mut internal_key, key_sz);
-
-        internal_key.put_slice(key);
-        internal_key.put_u64((seq << 8) | typ as u64);
-
-        internal_key
-    }
-
     #[test]
     fn block_test() {
-        let mut tb = TableBuilder::new(
-            FileOptions {
-                block_size: 4096 * 2,
-            },
-            Box::new(WritableFileImpl::new(Path::new("block.sst"))),
-        );
+        let mem = MemTable::new();
         for i in 0..300 {
-            let mut e = Entry::new(
+            let e = Entry::new(
                 (i as u32).to_be_bytes().to_vec(),
                 (i as u32).to_be_bytes().to_vec(),
                 i,
             );
-            e.key = build_internal_key(&e, 0);
-            tb.add(&e.key, &e.value);
+            mem.set(e);
         }
-        tb.finish();
+
+        TableBuilder::build_table(
+            "block.sst",
+            FileOptions {
+                block_size: 4096 * 2,
+            },
+            MemTableIterator::new(&mem),
+        );
+        let mut mem_iter = MemTableIterator::new(&mem);
 
         let mut file = std::fs::File::open(Path::new("block.sst")).unwrap();
         let mut buf = Vec::new();
@@ -243,14 +253,16 @@ mod block_test {
 
         let block = Block::decode(&buf[..index_offset as usize]);
         let iter = BlockIterator::new(Arc::new(block));
-        for (i, ele) in iter.enumerate() {
-            let e = Entry::new(
-                (i as u32).to_be_bytes().to_vec(),
-                (i as u32).to_be_bytes().to_vec(),
-                i as u64,
-            );
-            let expected_key = build_internal_key(&e, 0);
-            assert_eq!(ele.key, expected_key);
+        for (_, ele) in iter.enumerate() {
+            let e = mem_iter.next().unwrap();
+            // let e = Entry::new(
+            //     (i as u32).to_be_bytes().to_vec(),
+            //     (i as u32).to_be_bytes().to_vec(),
+            //     i as u64,
+            // );
+
+            // let expected_key = build_internal_key(&e, 0);
+            assert_eq!(ele.key, e.key);
             assert_eq!(ele.value, e.value);
         }
     }

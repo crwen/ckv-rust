@@ -89,12 +89,17 @@ impl Key {
         // bytes.get_u64() >> 8
         bytes.get_u64() >> 8
     }
+
+    pub fn len(&self) -> u64 {
+        self.key.len() as u64
+    }
 }
 
 /// A basic mem-table based on crossbeam-skiplist
 pub struct MemTable {
     table: Arc<Table>,
     refs: AtomicU64,
+    size: AtomicU64,
 }
 
 impl MemTable {
@@ -102,6 +107,7 @@ impl MemTable {
         Self {
             table: Arc::new(Table::new()),
             refs: AtomicU64::new(1),
+            size: AtomicU64::new(1),
         }
     }
 
@@ -116,7 +122,8 @@ impl MemTable {
         }
     }
 
-    pub fn get(&self, entry: Entry) -> Option<Bytes> {
+    pub fn get(&self, key: &[u8], seq: u64) -> Option<Bytes> {
+        let entry = Entry::new(key.to_vec(), vec![], seq);
         let internal_key = MemTable::build_internal_key(&entry, OP_TYPE_PUT);
         let e = Entry::new(entry.key, vec![], 0);
         let right = MemTable::build_internal_key(&e, OP_TYPE_PUT);
@@ -139,12 +146,18 @@ impl MemTable {
     // +-----------------------+   +--------------------+
     pub fn set(&self, entry: Entry) {
         let internal_key = MemTable::build_internal_key(&entry, OP_TYPE_PUT);
-        self.table
-            .insert(internal_key, MemTable::build_value(&entry));
+        let value = MemTable::build_value(&entry);
+        self.size
+            .fetch_add(internal_key.len() + value.len() as u64, Ordering::SeqCst);
+        self.table.insert(internal_key, value);
     }
 
     pub fn colse(&self) {
         self.decr_refs()
+    }
+
+    pub fn approximate_memory_usage(&self) -> u64 {
+        self.size.load(Ordering::SeqCst)
     }
 
     // +-----------------------+
@@ -242,7 +255,7 @@ impl<'a> MemTableIterator<'a> {
 }
 
 #[cfg(test)]
-mod memtable_tests {
+mod mem_tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
@@ -282,33 +295,33 @@ mod memtable_tests {
         // let e3 = Entry::new(vec![3], vec![], 0);
         // let e4 = Entry::new(vec![3], vec![], 4);
         // let e4 = Entry::new(vec![2], vec![], 5);
-        let res = memtable.get(e);
+        let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, None);
         let e = Entry::new(vec![1], vec![], 2);
-        let res = memtable.get(e);
+        let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, Some(Bytes::from(vec![12])));
         let e = Entry::new(vec![1], vec![], 5);
-        let res = memtable.get(e);
+        let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, Some(Bytes::from(vec![13])));
 
         let e = Entry::new(vec![2], vec![], 5);
-        let res = memtable.get(e);
+        let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, None);
 
         let e = Entry::new(vec![3], vec![], 5);
-        let res = memtable.get(e);
+        let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, Some(Bytes::from(vec![34])));
 
         let e = Entry::new(vec![22], vec![], 5);
-        let res = memtable.get(e);
+        let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, None);
 
         let e = Entry::new(vec![254, 233, 234], vec![], 8);
-        let res = memtable.get(e);
+        let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, None);
 
         let e = Entry::new(vec![254, 233, 234], vec![], 9);
-        let res = memtable.get(e);
+        let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, Some(Bytes::from(vec![254, 233, 234])));
     }
 
