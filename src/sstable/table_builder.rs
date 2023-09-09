@@ -99,7 +99,7 @@ mod builder_test {
     use bytes::Buf;
 
     use crate::{
-        sstable::block::{Block, BlockIterator, BLOCK_TRAILER_SIZE_},
+        sstable::block::{Block, BLOCK_TRAILER_SIZE_},
         utils::{
             file::{FileOptions, WritableFileImpl},
             Entry,
@@ -112,7 +112,7 @@ mod builder_test {
     fn test_write() {
         let mut tb = TableBuilder::new(
             FileOptions { block_size: 4096 },
-            Box::new(WritableFileImpl::new(Path::new("0001.sst"))),
+            Box::new(WritableFileImpl::new(Path::new("builder.sst"))),
         );
         for i in 0..1000 {
             let e = Entry::new(
@@ -124,7 +124,7 @@ mod builder_test {
         }
         tb.finish();
 
-        let mut file = std::fs::File::open(Path::new("0001.sst")).unwrap();
+        let mut file = std::fs::File::open(Path::new("builder.sst")).unwrap();
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).unwrap();
 
@@ -135,7 +135,8 @@ mod builder_test {
 
         let index = &buf[index_offset..index_end];
         let index_block = Block::decode(index);
-        let index_iter = BlockIterator::new(&index_block);
+
+        let index_iter = index_block.into_iter();
         let mut i: u32 = 0;
         index_iter.for_each(|e| {
             let last_key = e.key;
@@ -147,7 +148,7 @@ mod builder_test {
             let data_block = Block::decode(data);
             // Block::decode(data);
             let mut lkey: Vec<u8> = Vec::new();
-            let iter = BlockIterator::new(&data_block);
+            let iter = data_block.into_iter();
             iter.for_each(|e| {
                 let expected_key = i.to_be_bytes();
                 let expected_value = i.to_be_bytes();

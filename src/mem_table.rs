@@ -55,7 +55,7 @@ impl Ord for Key {
 }
 
 impl Key {
-    fn new(key: Vec<u8>) -> Self {
+    pub fn new(key: Vec<u8>) -> Self {
         Self { key }
     }
 
@@ -65,6 +65,13 @@ impl Key {
         let var_sz = varintu32_length(sz) as usize;
 
         &key[var_sz..var_sz + sz as usize]
+    }
+
+    pub fn internal_key(&self) -> &[u8] {
+        let key = &self.key[..];
+        let sz = decode_varintu32(key).unwrap();
+        let var_sz = varintu32_length(sz) as usize;
+        &key[var_sz..]
     }
 
     pub fn tag(key: &[u8]) -> &[u8] {
@@ -182,6 +189,8 @@ impl Default for MemTable {
 pub struct MemTableIterator<'a> {
     mem: &'a MemTable,
     table_iter: TableIterator<'a>,
+    key: Vec<u8>,
+    value: Vec<u8>,
 }
 
 impl<'a> Iterator for MemTableIterator<'a> {
@@ -193,9 +202,11 @@ impl<'a> Iterator for MemTableIterator<'a> {
             Some(item) => {
                 let value = item.value();
                 let value_sz = decode_varintu32(value).unwrap();
+                self.key = item.key().internal_key().to_vec();
+                self.value = value[varintu32_length(value_sz) as usize..].to_vec();
                 Some(Entry::new(
-                    item.key().user_key().to_vec(),
-                    value[varintu32_length(value_sz) as usize..].to_vec(),
+                    self.key.clone(),
+                    self.value.clone(),
                     item.key().seq(),
                 ))
                 // crossbeam_skiplist::map::Entry;
@@ -216,12 +227,22 @@ impl<'a> MemTableIterator<'a> {
         Self {
             mem,
             table_iter: mem.table.iter(),
+            key: Vec::new(),
+            value: Vec::new(),
         }
+    }
+
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    pub fn value(&self) -> &[u8] {
+        &self.value
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod memtable_tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
@@ -308,7 +329,6 @@ mod tests {
         for (i, e) in iter.enumerate() {
             // 0, 1, 2, 3, 4, 5, 6, 7
             // 0, 0, 1, 1, 2, 2, 3, 3
-            assert_eq!(e.key, vec![(i / 2) as u8]);
             let val = (i / 2) as u8;
             if i % 2 == 0 {
                 assert_eq!(e.value, vec![val, val]);

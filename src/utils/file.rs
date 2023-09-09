@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{Error, Write};
+use std::os::unix::prelude::FileExt;
 use std::path::Path;
 
 pub trait WriteableFile {
@@ -13,6 +14,13 @@ pub trait WriteableFile {
 pub trait SequentialFile {
     // read n bytes
     fn read(&self, n: usize) -> Vec<u8>;
+}
+
+pub trait RandomAccessFile {
+    // read n bytes
+    fn read(&self, buf: &mut [u8], offset: u64) -> Result<(), Error>;
+
+    fn size(&self) -> Result<u64, Error>;
 }
 
 pub struct WritableFileImpl {
@@ -68,6 +76,33 @@ impl WritableFileImpl {
     }
 }
 
+pub struct RandomAccessFileImpl {
+    // filename: String,
+    // path: Path,
+    file: std::fs::File,
+}
+
+impl RandomAccessFileImpl {
+    pub fn open(path: &Path) -> Self {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(err) => panic!("{}", err),
+        };
+        Self { file }
+    }
+}
+
+impl RandomAccessFile for RandomAccessFileImpl {
+    fn read(&self, buf: &mut [u8], offset: u64) -> Result<(), Error> {
+        self.file.read_exact_at(buf, offset)
+    }
+
+    fn size(&self) -> Result<u64, Error> {
+        let meta = self.file.metadata()?;
+        Ok(meta.len())
+    }
+}
+
 // pub struct SequentialFileImpl {
 //     // filename: String,
 //     // path: Path,
@@ -96,10 +131,10 @@ impl WritableFileImpl {
 // }
 
 #[cfg(test)]
-mod filetest {
+mod file_test {
     use std::path::Path;
 
-    use super::{WritableFileImpl, WriteableFile};
+    use super::{RandomAccessFile, RandomAccessFileImpl, WritableFileImpl, WriteableFile};
 
     #[test]
     fn write_file_test() {
@@ -108,5 +143,10 @@ mod filetest {
         f.append(b"world!\n").unwrap();
         f.append(b"hello rust").unwrap();
         f.flush().unwrap();
+
+        let f = RandomAccessFileImpl::open(Path::new("hello.txt"));
+        let mut buf: Vec<u8> = vec![0_u8; 10];
+        f.read(&mut buf[..3], 0).unwrap();
+        assert_eq!(&buf[..3], b"hel");
     }
 }
