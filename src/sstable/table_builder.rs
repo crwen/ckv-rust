@@ -1,8 +1,11 @@
 use std::path::Path;
 
-use crate::utils::{
-    file::{FileOptions, WritableFileImpl, WriteableFile},
-    Entry,
+use crate::{
+    utils::{
+        file::{WritableFileImpl, WriteableFile},
+        Entry,
+    },
+    Options,
 };
 
 use super::{block::BlockHandler, block_builder::BlockBuilder};
@@ -13,7 +16,7 @@ enum BlockType {
 }
 /// A block builder
 pub struct TableBuilder {
-    file_opt: FileOptions,
+    file_opt: Options,
     file: Box<dyn WriteableFile>,
     data_block: BlockBuilder,
     index_block: BlockBuilder,
@@ -24,7 +27,7 @@ pub struct TableBuilder {
 }
 
 impl TableBuilder {
-    pub fn new(file_opt: FileOptions, file: Box<dyn WriteableFile>) -> Self {
+    pub fn new(file_opt: Options, file: Box<dyn WriteableFile>) -> Self {
         TableBuilder {
             file_opt,
             pending_handler: BlockHandler::new(),
@@ -37,7 +40,7 @@ impl TableBuilder {
         }
     }
 
-    pub fn build_table<T>(dbname: &str, opt: FileOptions, iter: T)
+    pub fn build_table<T>(dbname: &str, opt: Options, iter: T)
     where
         T: Iterator<Item = Entry>,
     {
@@ -118,7 +121,8 @@ mod builder_test {
     use crate::{
         mem_table::{MemTable, MemTableIterator},
         sstable::block::{Block, BLOCK_TRAILER_SIZE_},
-        utils::{file::FileOptions, Entry},
+        utils::Entry,
+        Options,
     };
 
     use super::TableBuilder;
@@ -136,7 +140,7 @@ mod builder_test {
         }
         TableBuilder::build_table(
             "builder.sst",
-            FileOptions { block_size: 4096 },
+            Options { block_size: 4096 },
             MemTableIterator::new(&mem),
         );
         let mut mem_iter = MemTableIterator::new(&mem);

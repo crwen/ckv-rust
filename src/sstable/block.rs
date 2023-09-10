@@ -216,7 +216,8 @@ mod block_test {
     use crate::{
         mem_table::{MemTable, MemTableIterator},
         sstable::table_builder::TableBuilder,
-        utils::{file::FileOptions, Entry},
+        utils::Entry,
+        Options,
     };
 
     use super::{Block, BlockIterator};
@@ -235,7 +236,7 @@ mod block_test {
 
         TableBuilder::build_table(
             "block.sst",
-            FileOptions {
+            Options {
                 block_size: 4096 * 2,
             },
             MemTableIterator::new(&mem),

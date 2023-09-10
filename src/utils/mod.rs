@@ -1,8 +1,10 @@
 pub mod codec;
 pub mod convert;
 pub mod file;
+pub mod log_reader;
+pub mod log_writer;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Entry {
     pub key: Vec<u8>,
     pub value: Vec<u8>,

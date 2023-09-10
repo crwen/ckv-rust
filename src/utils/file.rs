@@ -13,7 +13,7 @@ pub trait WriteableFile {
 // A file abstraction for reading sequentially through a file
 pub trait SequentialFile {
     // read n bytes
-    fn read(&self, n: usize) -> Vec<u8>;
+    fn read(&mut self, buf: &mut [u8]) -> Result<(), Error>;
 }
 
 pub trait RandomAccessFile {
@@ -27,18 +27,6 @@ pub struct WritableFileImpl {
     // filename: String,
     // path: Path,
     file: std::fs::File,
-}
-
-pub struct FileOptions {
-    // dir: String,
-    // filename: String,
-    pub block_size: usize,
-}
-
-impl FileOptions {
-    pub fn block_size(&self) -> usize {
-        self.block_size
-    }
 }
 
 impl WriteableFile for WritableFileImpl {
@@ -103,32 +91,35 @@ impl RandomAccessFile for RandomAccessFileImpl {
     }
 }
 
-// pub struct SequentialFileImpl {
-//     // filename: String,
-//     // path: Path,
-//     file: std::fs::File,
-// }
+pub struct SequentialFileImpl {
+    file: std::fs::File,
+    offset: u64,
+    // file_sz: u64,
+}
 
-// impl SequentialFileImpl {
-//     pub fn new(path: &Path) -> Self {
-//         // Open a file in read-only mode, returns `io::Result<File>`
-//         let file = match File::open(path) {
-//             Ok(f) => f,
-//             Err(err) => panic!("{}", err),
-//         };
-//         Self {
-//             // filename: String::from(""),
-//             // path,
-//             file,
-//         }
-//     }
-// }
-//
-// impl SequentialFile for SequentialFileImpl {
-//     fn read(&self, n: usize) -> Vec<u8> {
-//         // self.file.read_exact(buf)
-//     }
-// }
+impl SequentialFileImpl {
+    // Open a file in read-only mode
+    pub fn new(path: &Path) -> Self {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(err) => panic!("{}", err),
+        };
+        // let file_sz = file.metadata().unwrap().len();
+        Self {
+            file,
+            offset: 0,
+            // file_sz,
+        }
+    }
+}
+
+impl SequentialFile for SequentialFileImpl {
+    fn read(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        self.file.read_exact_at(buf, self.offset)?;
+        self.offset += buf.len() as u64;
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod file_test {

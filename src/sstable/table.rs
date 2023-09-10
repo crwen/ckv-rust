@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use bytes::Buf;
 
-use crate::utils::{
-    file::{FileOptions, RandomAccessFile},
-    Entry,
+use crate::{
+    utils::{file::RandomAccessFile, Entry},
+    Options,
 };
 
 use super::{
@@ -14,13 +14,13 @@ use super::{
 
 pub struct Table {
     #[allow(unused)]
-    file_opt: FileOptions,
+    file_opt: Options,
     file: Box<dyn RandomAccessFile>,
     index_block: Block,
 }
 
 impl Table {
-    pub fn new(file_opt: FileOptions, file: Box<dyn RandomAccessFile>) -> Result<Self> {
+    pub fn new(file_opt: Options, file: Box<dyn RandomAccessFile>) -> Result<Self> {
         let mut footer = vec![0_u8; 8];
         let sz = file.size().unwrap();
         file.read(&mut footer, sz - 8).unwrap();
@@ -119,10 +119,8 @@ mod table_test {
     use crate::{
         mem_table::{MemTable, MemTableIterator},
         sstable::{table::Table, table_builder::TableBuilder},
-        utils::{
-            file::{FileOptions, RandomAccessFileImpl},
-            Entry,
-        },
+        utils::{file::RandomAccessFileImpl, Entry},
+        Options,
     };
 
     #[test]
@@ -139,11 +137,11 @@ mod table_test {
         let mut mem_iter = MemTableIterator::new(&mem);
         TableBuilder::build_table(
             "table.sst",
-            FileOptions { block_size: 4096 },
+            Options { block_size: 4096 },
             MemTableIterator::new(&mem),
         );
         let t = Table::new(
-            FileOptions { block_size: 4096 },
+            Options { block_size: 4096 },
             Box::new(RandomAccessFileImpl::open(Path::new("table.sst"))),
         )
         .unwrap();
