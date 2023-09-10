@@ -1,6 +1,6 @@
 use bytes::{Buf, Bytes};
 
-pub mod verset_edit;
+pub mod version_edit;
 pub mod version_set;
 
 #[derive(Debug, Clone, Default)]
