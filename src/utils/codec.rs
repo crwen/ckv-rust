@@ -79,7 +79,6 @@ mod codec_tests {
         let mut buf = vec![];
         let x: u32 = 1 << 7;
         let len = encode_varintu32(&mut buf, x);
-        println!("{:?}", buf);
         assert_eq!(len, 2);
         let y = decode_varintu32(&buf[..]);
         assert_eq!(y.unwrap(), x);

@@ -1,8 +1,8 @@
 pub mod codec;
 pub mod convert;
-pub mod file;
-pub mod log_reader;
-pub mod log_writer;
+
+pub const OP_TYPE_DELETE: u8 = 0;
+pub const OP_TYPE_PUT: u8 = 1;
 
 #[derive(Clone, Debug)]
 pub struct Entry {

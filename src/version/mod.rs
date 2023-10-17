@@ -1,4 +1,4 @@
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 
 pub mod version_edit;
 pub mod version_set;
@@ -7,7 +7,7 @@ pub mod version_set;
 pub struct FileMetaData {
     // refs: i32,
     number: u64,
-    // file_size: u64,        // File size in bytes
+    file_size: u64,        // File size in bytes
     smallest: InternalKey, // Smallest internal key served by table
     largest: InternalKey,  // Largest internal key served by table
 }
@@ -17,7 +17,7 @@ impl FileMetaData {
         Self {
             // refs: 0,
             number,
-            // file_size: 0,
+            file_size: 0,
             smallest: InternalKey::new(vec![]),
             largest: InternalKey::new(vec![]),
         }
@@ -27,10 +27,24 @@ impl FileMetaData {
         Self {
             // refs: 0,
             number,
-            // file_size: 0,
+            file_size: 0,
             smallest: InternalKey::new(smallest.to_vec()),
             largest: InternalKey::new(largest.to_vec()),
         }
+    }
+
+    pub fn with_internal_range(number: u64, smallest: InternalKey, largest: InternalKey) -> Self {
+        Self {
+            // refs: 0,
+            number,
+            file_size: 0,
+            smallest,
+            largest,
+        }
+    }
+
+    pub fn set_file_size(&mut self, file_size: u64) {
+        self.file_size = file_size;
     }
 
     pub fn number(&self) -> u64 {
@@ -41,16 +55,26 @@ impl FileMetaData {
         &self.smallest
     }
 
-    pub fn set_smallest(&mut self, smallest: &[u8]) {
-        self.smallest = InternalKey::new(smallest.to_vec());
+    pub fn set_smallest(&mut self, smallest: InternalKey) {
+        self.smallest = smallest;
     }
 
     pub fn largest(&self) -> &InternalKey {
         &self.largest
     }
 
-    pub fn set_largest(&mut self, largest: &[u8]) {
-        self.smallest = InternalKey::new(largest.to_vec());
+    pub fn set_largest(&mut self, largest: InternalKey) {
+        self.largest = largest;
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.put_u64(self.number);
+        buf.put_u32(self.smallest.len());
+        buf.put(self.smallest.key().as_slice());
+        buf.put_u32(self.largest.len());
+        buf.put(self.largest.key().as_slice());
+        buf
     }
 }
 
@@ -97,6 +121,10 @@ impl InternalKey {
         Self { key }
     }
 
+    pub fn key(&self) -> Vec<u8> {
+        self.key.clone()
+    }
+
     pub fn user_key(&self) -> &[u8] {
         let len = self.key.len();
         &self.key[..len - 8]
@@ -110,7 +138,11 @@ impl InternalKey {
         bytes.get_u64() >> 8
     }
 
-    // pub fn len(&self) -> u64 {
-    //     self.key.len() as u64
-    // }
+    pub fn len(&self) -> u32 {
+        self.key.len() as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.key.is_empty()
+    }
 }

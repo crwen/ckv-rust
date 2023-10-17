@@ -8,10 +8,8 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::utils::{
     codec::{decode_varintu32, encode_varintu32, varintu32_length},
-    Entry,
+    Entry, OP_TYPE_DELETE, OP_TYPE_PUT,
 };
-
-const OP_TYPE_PUT: u8 = 0;
 
 type Table = SkipMap<Key, Bytes>;
 type TableIterator<'a> = crossbeam_skiplist::map::Iter<'a, Key, Bytes>;
@@ -90,7 +88,7 @@ impl Key {
         bytes.get_u64() >> 8
     }
 
-    pub fn len(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         self.key.len() as u64
     }
 }
@@ -141,12 +139,24 @@ impl MemTable {
         })
     }
 
+    pub fn put(&self, entry: Entry) {
+        self.set(entry, OP_TYPE_PUT);
+    }
+
+    pub fn delete(&self, entry: Entry) {
+        self.set(entry, OP_TYPE_DELETE);
+    }
+
     // +-----------------------+   +--------------------+
     // |  key_size | key | tag |   | value_size | value |
     // +-----------------------+   +--------------------+
-    pub fn set(&self, entry: Entry) {
-        let internal_key = MemTable::build_internal_key(&entry, OP_TYPE_PUT);
-        let value = MemTable::build_value(&entry);
+    pub fn set(&self, entry: Entry, typ: u8) {
+        let internal_key = MemTable::build_internal_key(&entry, typ);
+        let value = if typ == OP_TYPE_PUT {
+            MemTable::build_value(&entry)
+        } else {
+            Bytes::from("")
+        };
         self.size
             .fetch_add(internal_key.len() + value.len() as u64, Ordering::SeqCst);
         self.table.insert(internal_key, value);
@@ -273,17 +283,17 @@ mod mem_tests {
     fn build_base_table() -> MemTable {
         let memtable = MemTable::new();
         let e = Entry::new(vec![3], vec![30], 0);
-        memtable.set(e);
+        memtable.put(e);
         let e = Entry::new(vec![1], vec![11], 1);
-        memtable.set(e);
+        memtable.put(e);
         let e = Entry::new(vec![1], vec![12], 2);
-        memtable.set(e);
+        memtable.put(e);
         let e = Entry::new(vec![1], vec![13], 3);
-        memtable.set(e);
+        memtable.put(e);
         let e = Entry::new(vec![3], vec![34], 4);
-        memtable.set(e);
+        memtable.put(e);
         let e = Entry::new(vec![254, 233, 234], vec![254, 233, 234], 9);
-        memtable.set(e);
+        memtable.put(e);
 
         memtable
     }
@@ -331,11 +341,11 @@ mod mem_tests {
         assert_eq!(memtable.refs.load(Ordering::SeqCst), 1);
         for i in 0..100 {
             let e = Entry::new(vec![i], vec![i], i as u64);
-            memtable.set(e);
+            memtable.put(e);
         }
         for i in 0..100 {
             let e = Entry::new(vec![i], vec![i, i], (i + 100) as u64);
-            memtable.set(e);
+            memtable.put(e);
         }
         let iter = MemTableIterator::new(&memtable);
         assert_eq!(memtable.refs.load(Ordering::SeqCst), 2);
@@ -349,7 +359,6 @@ mod mem_tests {
                 assert_eq!(e.value, vec![val]);
             }
         }
-        // iter.for_each(|e| println!("{:?}", e));
         assert_eq!(memtable.refs.load(Ordering::SeqCst), 1);
         // memtable.colse();
     }

@@ -4,28 +4,25 @@ use bytes::Buf;
 
 use crate::utils::codec::verify_checksum;
 
-use super::file::SequentialFile;
+use super::SequentialAccess;
 
 pub struct Reader {
-    file: Box<dyn SequentialFile>,
+    file: Box<dyn SequentialAccess>,
     offset: u64,
 }
 
 impl Reader {
-    pub fn new(file: Box<dyn SequentialFile>) -> Self {
+    pub fn new(file: Box<dyn SequentialAccess>) -> Self {
         Self { file, offset: 0 }
     }
 
     pub fn read_record(&mut self) -> Result<Vec<u8>, Error> {
         let mut buf = vec![0_u8; 12];
         self.file.read(&mut buf)?;
-        println!("header .........{:?}", buf);
         let checksum = (&buf[..]).get_u64();
         let len = (&buf[8..]).get_u32();
-        println!("len .........{:?}", len);
         let mut data = vec![0_u8; len as usize];
         self.file.read(&mut data)?;
-        println!("data .........{:?}", data);
         verify_checksum(&data, checksum).unwrap();
         self.offset += 12 + data.len() as u64;
         Ok(data)
@@ -35,34 +32,45 @@ impl Reader {
 #[cfg(test)]
 mod log_reader_test {
     use core::panic;
-    use std::{io::ErrorKind, path::Path};
+    use std::io::ErrorKind;
 
     use crate::{
+        file::{path_of_file, readable::SequentialFileImpl, Ext},
         lsm::Lsm,
         utils::{
             codec::{decode_varintu32, varintu32_length},
-            file::SequentialFileImpl,
-            log_reader::Reader,
             Entry,
         },
         Options,
     };
 
+    use super::Reader;
+
     #[test]
     fn log_reader_test() {
+        let opt = Options {
+            block_size: 4096,
+            work_dir: String::from("work_dir/log"),
+            mem_size: 4096,
+        };
+        let path = path_of_file(&opt.work_dir, 0, Ext::WAL);
+
+        if std::fs::metadata(&opt.work_dir).is_ok() {
+            std::fs::remove_dir_all(&opt.work_dir).unwrap()
+        };
         {
-            let mut lsm = Lsm::new(Options { block_size: 4096 });
+            let lsm = Lsm::open(opt);
             for i in 0..100 {
                 let e = Entry::new(
                     (i as u32).to_be_bytes().to_vec(),
                     (i as u32).to_be_bytes().to_vec(),
                     i,
                 );
-                lsm.set(&e.key, &e.value);
+                lsm.put(&e.key, &e.value).unwrap();
             }
         }
 
-        let mut log = Reader::new(Box::new(SequentialFileImpl::new(Path::new("0.wal"))));
+        let mut log = Reader::new(Box::new(SequentialFileImpl::new(path.as_path())));
         let mut i: u32 = 0;
         let mut end = false;
         while !end {
@@ -74,7 +82,6 @@ mod log_reader_test {
                     let var_key_sz = varintu32_length(key_sz) as usize;
                     let key = &data[var_key_sz..var_key_sz + key_sz as usize];
                     let expected_key = i.to_be_bytes();
-                    println!("{:?}", key);
                     assert_eq!(key, expected_key);
                 }
                 Err(err) => match err.kind() {

@@ -20,7 +20,6 @@ mod tests {
         let res = u32vec_to_bytes(&v);
         assert_eq!(res.len(), 12);
 
-        println!("{:?}", res);
         let expected = [0, 0, 48, 57, 0, 0, 91, 160, 0, 0, 135, 7];
         assert_eq!(res, expected);
     }

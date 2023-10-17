@@ -1,10 +1,9 @@
-use std::path::Path;
+use std::{io::Error, path::Path};
 
 use crate::{
-    utils::{
-        file::{WritableFileImpl, WriteableFile},
-        Entry,
-    },
+    file::{writeable::WritableFileImpl, Writable},
+    utils::Entry,
+    version::{FileMetaData, InternalKey},
     Options,
 };
 
@@ -17,7 +16,7 @@ enum BlockType {
 /// A block builder
 pub struct TableBuilder {
     file_opt: Options,
-    file: Box<dyn WriteableFile>,
+    file: Box<dyn Writable>,
     data_block: BlockBuilder,
     index_block: BlockBuilder,
     offset: u32,
@@ -27,7 +26,7 @@ pub struct TableBuilder {
 }
 
 impl TableBuilder {
-    pub fn new(file_opt: Options, file: Box<dyn WriteableFile>) -> Self {
+    pub fn new(file_opt: Options, file: Box<dyn Writable>) -> Self {
         TableBuilder {
             file_opt,
             pending_handler: BlockHandler::new(),
@@ -40,16 +39,32 @@ impl TableBuilder {
         }
     }
 
-    pub fn build_table<T>(dbname: &str, opt: Options, iter: T)
+    pub fn build_table<T>(
+        path: &Path,
+        opt: Options,
+        iter: T,
+        meta: &mut FileMetaData,
+    ) -> Result<(), Error>
     where
         T: Iterator<Item = Entry>,
     {
-        let mut tb = TableBuilder::new(opt, Box::new(WritableFileImpl::new(Path::new(dbname))));
+        let (mut largest, mut smallest) = (InternalKey::new(vec![]), InternalKey::new(vec![]));
+        let mut tb = TableBuilder::new(opt, Box::new(WritableFileImpl::new(path)));
 
-        iter.for_each(|e| tb.add(&e.key, &e.value));
+        iter.for_each(|e| {
+            if smallest.is_empty() {
+                smallest = InternalKey::new(e.key.to_vec());
+            }
+            largest = InternalKey::new(e.key.to_vec());
+            tb.add(&e.key, &e.value);
+        });
 
         tb.finish();
-        tb.file.sync().unwrap();
+        tb.file.sync()?;
+
+        meta.set_smallest(smallest);
+        meta.set_largest(largest);
+        Ok(())
     }
 
     /// TODO: prefix compaction
@@ -114,14 +129,16 @@ impl TableBuilder {
 
 #[cfg(test)]
 mod builder_test {
-    use std::{io::Read, path::Path};
+    use std::io::Read;
 
     use bytes::Buf;
 
     use crate::{
+        file::{path_of_file, Ext},
         mem_table::{MemTable, MemTableIterator},
         sstable::block::{Block, BLOCK_TRAILER_SIZE_},
         utils::Entry,
+        version::FileMetaData,
         Options,
     };
 
@@ -136,16 +153,31 @@ mod builder_test {
                 (i as u32).to_be_bytes().to_vec(),
                 i,
             );
-            mem.set(e);
+            mem.put(e);
         }
+
+        let opt = Options {
+            block_size: 4096,
+            work_dir: "work_dir/table_builder".to_string(),
+            mem_size: 4096,
+        };
+        let path = path_of_file(&opt.work_dir, 10, Ext::SST);
+
+        if std::fs::metadata(&opt.work_dir).is_ok() {
+            std::fs::remove_dir_all(&opt.work_dir).unwrap();
+        };
+        std::fs::create_dir(&opt.work_dir).expect("create work direction fail!");
+        let mut file_meta = FileMetaData::new(10);
         TableBuilder::build_table(
-            "builder.sst",
-            Options { block_size: 4096 },
+            path.as_path(),
+            opt,
             MemTableIterator::new(&mem),
-        );
+            &mut file_meta,
+        )
+        .unwrap();
         let mut mem_iter = MemTableIterator::new(&mem);
 
-        let mut file = std::fs::File::open(Path::new("builder.sst")).unwrap();
+        let mut file = std::fs::File::open(path).unwrap();
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).unwrap();
 

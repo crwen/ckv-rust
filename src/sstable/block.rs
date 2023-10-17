@@ -152,8 +152,6 @@ impl BlockIterator {
             let mid = ((high - low) >> 1) + low;
             let offset = self.block.entry_offsets[mid];
             let entry = self.block.read_entry_at(offset as usize).unwrap();
-            // println!("ekey{}, target {}, low {}, mid {}, high {}", e.key, )
-            // TODO: compare
 
             if BlockIterator::greater_or_equal(&entry.key, key) {
                 high = mid;
@@ -191,7 +189,7 @@ impl BlockIterator {
             std::cmp::Ordering::Equal => {
                 let seq1 = (&key[key.len() - 8..]).get_u64() >> 8;
                 let seq2 = (&target[target.len() - 8..]).get_u64() >> 8;
-                seq1 >= seq2
+                seq1 <= seq2
             }
         }
     }
@@ -209,14 +207,16 @@ impl Iterator for BlockIterator {
 
 #[cfg(test)]
 mod block_test {
-    use std::{io::Read, path::Path, sync::Arc};
+    use std::{io::Read, sync::Arc};
 
     use bytes::Buf;
 
     use crate::{
+        file::{path_of_file, Ext},
         mem_table::{MemTable, MemTableIterator},
         sstable::table_builder::TableBuilder,
         utils::Entry,
+        version::FileMetaData,
         Options,
     };
 
@@ -231,19 +231,31 @@ mod block_test {
                 (i as u32).to_be_bytes().to_vec(),
                 i,
             );
-            mem.set(e);
+            mem.put(e);
         }
 
+        let opt = Options {
+            block_size: 4096 * 2,
+            work_dir: "work_dir/block".to_string(),
+            mem_size: 4096,
+        };
+        let path = path_of_file(&opt.work_dir, 1, Ext::SST);
+        if std::fs::metadata(&opt.work_dir).is_ok() {
+            std::fs::remove_dir_all(&opt.work_dir).unwrap();
+        };
+        std::fs::create_dir(&opt.work_dir).expect("create work direction fail!");
+
+        let mut file_meta = FileMetaData::new(0);
         TableBuilder::build_table(
-            "block.sst",
-            Options {
-                block_size: 4096 * 2,
-            },
+            path.as_path(),
+            opt,
             MemTableIterator::new(&mem),
-        );
+            &mut file_meta,
+        )
+        .unwrap();
         let mut mem_iter = MemTableIterator::new(&mem);
 
-        let mut file = std::fs::File::open(Path::new("block.sst")).unwrap();
+        let mut file = std::fs::File::open(path).unwrap();
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).unwrap();
 
