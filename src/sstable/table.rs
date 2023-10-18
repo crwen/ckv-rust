@@ -28,9 +28,10 @@ impl Table {
         let index_offset = (&footer[..4]).get_u32();
         let index_sz = (&footer[4..]).get_u32();
 
-        let mut index_data = vec![1_u8; index_sz as usize + BLOCK_TRAILER_SIZE_];
+        let mut index_data = vec![0_u8; index_sz as usize + BLOCK_TRAILER_SIZE_];
         file.read(&mut index_data, index_offset as u64).unwrap();
         let index_block = Block::decode(&index_data);
+
         Ok(Self {
             // file_opt,
             file,
@@ -52,6 +53,7 @@ impl Table {
         self.file.read(&mut data, handler.offset() as u64).unwrap();
         let data_block = Arc::new(Block::decode(&data));
         let mut data_iter = BlockIterator::new(data_block);
+
         if let Some(e) = data_iter.seek(internal_key) {
             let found = InternalKey::new(e.clone().key);
             let target = InternalKey::new(internal_key.to_vec());
@@ -77,6 +79,7 @@ pub struct TableIterator {
     index_iter: BlockIterator,
     block_iter: BlockIterator,
     idx_block: usize,
+    curr: Option<Entry>,
 }
 
 impl TableIterator {
@@ -93,6 +96,7 @@ impl TableIterator {
         if table.file.read(&mut data, offset as u64).is_err() {
             return Err(super::TableError::DecodeTableError);
         }
+
         let data_block = Block::decode(&data);
         let data_iter = data_block.into_iter();
 
@@ -101,8 +105,18 @@ impl TableIterator {
             index_iter,
             block_iter: data_iter,
             idx_block: 0,
+            curr: None,
         };
         Ok(it)
+    }
+
+    pub fn key(&self) -> Option<InternalKey> {
+        let entry = self.curr.clone()?;
+        Some(InternalKey::new(entry.key))
+    }
+
+    pub fn item(&self) -> Option<Entry> {
+        self.curr.clone()
     }
 }
 impl Iterator for TableIterator {
@@ -114,19 +128,25 @@ impl Iterator for TableIterator {
         let mut res = self.block_iter.next();
         if res.is_none() {
             self.idx_block += 1;
-            let e = self.index_iter.next().unwrap();
-            let handler = BlockHandler::decode(&e.value).unwrap();
-            self.table.read_block(handler);
+            if let Some(e) = self.index_iter.next() {
+                // let e = self.index_iter.next()?;
+                let handler = BlockHandler::decode(&e.value).expect("Decode block fail!");
 
-            // TODO: next block
-            res = self.block_iter.next();
+                let data_block = self.table.read_block(handler);
+                self.block_iter = data_block.into_iter();
+
+                res = self.block_iter.next();
+            }
         }
+        self.curr = res.clone();
         res
     }
 }
 
 #[cfg(test)]
 mod table_test {
+
+    use std::sync::Arc;
 
     use crate::{
         file::{path_of_file, readable::RandomAccessFileImpl, Ext},
@@ -136,6 +156,8 @@ mod table_test {
         version::FileMetaData,
         Options,
     };
+
+    use super::TableIterator;
 
     #[test]
     fn table_seek_test() {
@@ -159,11 +181,9 @@ mod table_test {
             std::fs::remove_dir_all(&opt.work_dir).unwrap();
         };
         std::fs::create_dir(&opt.work_dir).expect("create work direction fail!");
+
         let mut mem_iter = MemTableIterator::new(&mem);
-        if std::fs::metadata(path.as_path()).is_ok() {
-            std::fs::remove_file(path.as_path()).unwrap()
-        };
-        let mut file_meta = FileMetaData::new(2);
+        let mut file_meta = FileMetaData::new(1);
         TableBuilder::build_table(
             path.as_path(),
             opt,
@@ -182,5 +202,10 @@ mod table_test {
             assert_eq!(res.clone().unwrap().key(), &ikey.to_vec());
             assert_eq!(res.unwrap().value(), &ikey[..4].to_vec());
         }
+
+        let iter = TableIterator::new(Arc::new(t)).unwrap();
+        let mut count = 0;
+        iter.for_each(|_| count += 1);
+        assert_eq!(count, 1000)
     }
 }
