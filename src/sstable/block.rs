@@ -266,8 +266,10 @@ mod block_test {
 
         let block = Block::decode(&buf[..index_offset as usize]);
         let iter = BlockIterator::new(Arc::new(block));
+        let mut count = 0;
         for (_, ele) in iter.enumerate() {
             let e = mem_iter.next().unwrap();
+            count += 1;
             // let e = Entry::new(
             //     (i as u32).to_be_bytes().to_vec(),
             //     (i as u32).to_be_bytes().to_vec(),
@@ -278,5 +280,6 @@ mod block_test {
             assert_eq!(ele.key, e.key);
             assert_eq!(ele.value, e.value);
         }
+        assert_eq!(count, 300);
     }
 }

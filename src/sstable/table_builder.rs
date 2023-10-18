@@ -23,6 +23,8 @@ pub struct TableBuilder {
     pending_handler: BlockHandler,
     last_key: Vec<u8>,
     pending_index_entry: bool,
+    largest: InternalKey,
+    smallest: InternalKey,
 }
 
 impl TableBuilder {
@@ -36,6 +38,8 @@ impl TableBuilder {
             file,
             last_key: Vec::new(),
             pending_index_entry: false,
+            largest: InternalKey::new(vec![]),
+            smallest: InternalKey::new(vec![]),
         }
     }
 
@@ -48,27 +52,33 @@ impl TableBuilder {
     where
         T: Iterator<Item = Entry>,
     {
-        let (mut largest, mut smallest) = (InternalKey::new(vec![]), InternalKey::new(vec![]));
+        // let (mut largest, mut smallest) = (InternalKey::new(vec![]), InternalKey::new(vec![]));
         let mut tb = TableBuilder::new(opt, Box::new(WritableFileImpl::new(path)));
 
         iter.for_each(|e| {
-            if smallest.is_empty() {
-                smallest = InternalKey::new(e.key.to_vec());
-            }
-            largest = InternalKey::new(e.key.to_vec());
+            // if smallest.is_empty() {
+            //     smallest = InternalKey::new(e.key.to_vec());
+            // }
+            // largest = InternalKey::new(e.key.to_vec());
             tb.add(&e.key, &e.value);
         });
 
         tb.finish();
         tb.file.sync()?;
 
-        meta.set_smallest(smallest);
-        meta.set_largest(largest);
+        meta.set_file_size(tb.file.size()?);
+        meta.set_smallest(tb.smallest.clone());
+        meta.set_largest(tb.largest.clone());
         Ok(())
     }
 
     /// TODO: prefix compaction
     pub fn add(&mut self, key: &[u8], value: &[u8]) {
+        if self.smallest.is_empty() {
+            self.smallest = InternalKey::new(key.to_vec());
+        }
+        self.largest = InternalKey::new(key.to_vec());
+
         if self.pending_index_entry {
             self.index_block
                 .add(&self.last_key, &self.pending_handler.to_vec());
@@ -108,7 +118,16 @@ impl TableBuilder {
         };
     }
 
-    pub fn finish(&mut self) {
+    pub fn finish_builder(&mut self, meta: &mut FileMetaData) -> Result<(), Error> {
+        self.finish();
+        self.file.sync()?;
+        meta.set_file_size(self.file.size()?);
+        meta.set_smallest(self.smallest.clone());
+        meta.set_largest(self.largest.clone());
+        Ok(())
+    }
+
+    fn finish(&mut self) {
         // write last data block
         self.flush();
 

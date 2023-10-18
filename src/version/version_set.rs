@@ -1,40 +1,57 @@
 use std::{
-    collections::LinkedList,
-    io::Error,
+    collections::{HashSet, LinkedList},
+    // io::Error,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
     },
 };
 
+use anyhow::Ok;
 use bytes::BufMut;
 use parking_lot::RwLock;
 
 use crate::{
+    compactor::CompactionState,
     file::{
         log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext, RandomAccessFileImpl,
         Writable,
     },
-    sstable::table::Table,
+    sstable::{
+        merge::MergeIterator,
+        table::{Table, TableIterator},
+        table_builder::TableBuilder,
+    },
     utils::{Entry, OP_TYPE_PUT},
     Options,
 };
 
-use super::{version_edit::VersionEdit, FileMetaData};
+use super::{version_edit::VersionEdit, FileMetaData, InternalKey};
 
-type Result<T> = core::result::Result<T, Error>;
+// type Result<T> = core::result::Result<T, dyn Error>;
+type Result<T> = anyhow::Result<T, anyhow::Error>;
+
+const L0_COMPACTION_TRIGGER: u32 = 4;
+const L1_COMPACTION_TRIGGER: f64 = 1048576.0;
+// const L1_COMPACTION_TRIGGER: f64 = 100.0;
 
 #[derive(Default, Debug)]
 pub struct Version {
     files: Vec<Vec<FileMetaData>>,
+    refs: AtomicU32,
+    smallest_sequence: u64,
 }
 
 impl Version {
     pub fn new() -> Self {
         let mut files: Vec<Vec<FileMetaData>> = Vec::new();
         files.resize_with(7, std::vec::Vec::new);
-        Self { files }
+        Self {
+            files,
+            refs: AtomicU32::new(1),
+            smallest_sequence: 0,
+        }
     }
 
     pub fn build(version: Arc<Version>, edit: &VersionEdit) -> Self {
@@ -45,12 +62,39 @@ impl Version {
             files[level].push(f.file_meta.clone());
         }
 
-        for (i, f) in edit.delete_files.iter().enumerate() {
+        let mut set = HashSet::new();
+        edit.delete_files.iter().for_each(|f| {
+            set.insert(f.file_meta.number);
+        });
+        for f in edit.delete_files.iter() {
             let level = f.level as usize;
-            files[level].remove(i);
+            let id = f.file_meta.number;
+            if let Some(idx) = files[level].iter().position(|f| f.number == id) {
+                files[level].remove(idx);
+            }
         }
 
-        Self { files }
+        Self {
+            files,
+            refs: AtomicU32::new(1),
+            smallest_sequence: edit.last_seq_number,
+        }
+    }
+
+    pub fn refs(&self) {
+        self.refs.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn refs_cnt(&self) -> u32 {
+        self.refs.load(Ordering::SeqCst)
+    }
+
+    pub fn derefs(&self) {
+        self.refs.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn smallest_sequence(&self) -> u64 {
+        self.smallest_sequence
     }
 
     pub fn files(&self) -> &Vec<Vec<FileMetaData>> {
@@ -133,7 +177,7 @@ impl Version {
         if !self.overlap_in_level(level, smallest, largest) {
             // push t onext level if there is no overlap in next level.
             // and the #bytes overlapping in the level after that are limited
-            while level < 3 {
+            while level < 2 {
                 if self.overlap_in_level(level + 1, smallest, largest) {
                     break;
                 }
@@ -144,6 +188,46 @@ impl Version {
             }
         }
         level
+    }
+
+    pub fn pick_compact_level(&self) -> Option<usize> {
+        let mut best_score = 0_f64;
+        let mut best_level = 0_usize;
+        for (level, files) in self.files.iter().enumerate() {
+            let score = if level == 0 {
+                files.len() as f64 / L0_COMPACTION_TRIGGER as f64
+            } else {
+                self.total_size(level) / Version::max_bytes_for_level(level)
+            };
+            if score > best_score {
+                best_level = level;
+                best_score = score;
+            }
+        }
+        if best_score > 0.8 {
+            return Some(best_level);
+        }
+        None
+    }
+
+    fn total_size(&self, level: usize) -> f64 {
+        if level >= self.files.len() {
+            return 0_f64;
+        }
+        let mut size = 0;
+        self.files[level].iter().for_each(|f| size += f.file_size);
+        size as f64
+    }
+
+    fn max_bytes_for_level(level: usize) -> f64 {
+        // let mut result = 1048576.0;
+        let mut result = L1_COMPACTION_TRIGGER;
+        let mut level = level;
+        while level > 1 {
+            result *= 10.0;
+            level -= 1;
+        }
+        result
     }
 
     fn overlap_in_level(&self, level: u32, smallest: &[u8], largest: &[u8]) -> bool {
@@ -157,6 +241,21 @@ impl Version {
 
         !overlapping.is_empty()
     }
+
+    fn overlaping_inputs(&self, level: u32, smallest: &[u8], largest: &[u8]) -> Vec<FileMetaData> {
+        if self.files.len() <= level as usize {
+            return vec![];
+        }
+        let mut inputs = vec![];
+        self.files[level as usize]
+            .iter()
+            .filter(|f| !(f.smallest.user_key() > largest || f.largest.user_key() < smallest))
+            .for_each(|f| {
+                inputs.push(f.clone());
+            });
+
+        inputs
+    }
 }
 
 pub struct VersionSet {
@@ -166,6 +265,7 @@ pub struct VersionSet {
     next_file_number: AtomicU64,
     #[allow(dead_code)]
     log_file: Writer,
+    opt: Options,
 }
 
 #[allow(dead_code)]
@@ -190,14 +290,20 @@ impl VersionSet {
             log_file: Writer::new(WritableFileImpl::new(&path_of_file(
                 &opt.work_dir,
                 0,
-                Ext::WAL,
+                Ext::MANIFEST,
             ))),
+            opt,
         }
     }
 
     pub fn current(&self) -> Arc<Version> {
         let versions = self.versions.read();
         versions.back().unwrap().clone()
+    }
+
+    pub fn smallest_sequence(&self) -> u64 {
+        let versions = self.versions.read();
+        versions.front().unwrap().smallest_sequence()
     }
 
     pub fn new_file_number(&self) -> u64 {
@@ -212,14 +318,17 @@ impl VersionSet {
         self.last_sequence.fetch_add(n, Ordering::SeqCst)
     }
 
-    pub fn pick_level_for_mem_table_output(&self, smallest: &[u8], largest: &[u8]) -> u32 {
-        self.current()
-            .pick_level_for_mem_table_output(smallest, largest)
-    }
+    // pub fn pick_level_for_mem_table_output(&self, smallest: &[u8], largest: &[u8]) -> u32 {
+    //     self.current()
+    //         .pick_level_for_mem_table_output(smallest, largest)
+    // }
 
-    pub fn log_and_apply(&self, edit: VersionEdit) -> Result<()> {
+    pub fn log_and_apply(&self, mut edit: VersionEdit) -> Result<()> {
         // write manifest
         let mut data = vec![];
+        edit.last_seq_number(self.last_sequence());
+        edit.next_file_number(self.next_file_number.load(Ordering::SeqCst));
+
         edit.encode(&mut data);
         self.log_file.add_recore(&data)?;
 
@@ -227,8 +336,98 @@ impl VersionSet {
 
         // modify memory metadata
         let base = versions.back().unwrap().clone();
-        let current = Version::build(base, &edit);
+        let current = Version::build(base.clone(), &edit);
         versions.push_back(Arc::new(current));
+        base.derefs();
+
+        while let Some(v) = versions.front() {
+            // remove useless version
+            if v.refs_cnt() == 0 {
+                versions.pop_front();
+            } else {
+                break;
+            }
+        }
         Ok(())
+    }
+
+    fn pick_compaction(&self) -> Option<CompactionState> {
+        let current = self.current();
+        let mut base = vec![];
+        let target;
+
+        let level = current.pick_compact_level()?;
+        let mut files = current.files[level].clone();
+
+        if level == 0 {
+            files.sort_by(|f1, f2| match f1.smallest.cmp(&f2.smallest) {
+                std::cmp::Ordering::Equal => f1.largest.cmp(&f2.largest),
+                other => other,
+            });
+            let (mut smallest, mut largest) =
+                (files[0].smallest.user_key(), files[0].largest.user_key());
+            for f in files.iter() {
+                if !(f.smallest.user_key() > largest || f.largest.user_key() < smallest) {
+                    if f.smallest.user_key() < smallest {
+                        smallest = f.smallest.user_key();
+                    }
+                    if f.largest.user_key() < largest {
+                        largest = f.largest.user_key();
+                    }
+                    base.push(f.clone());
+                }
+            }
+            target = current.overlaping_inputs((level + 1) as u32, smallest, largest);
+        } else {
+            base.push(current.files[level][0].clone());
+            target = current.overlaping_inputs(
+                (level + 1) as u32,
+                current.files[level][0].smallest.user_key(),
+                current.files[level][0].largest.user_key(),
+            );
+        }
+
+        Some(CompactionState {
+            base_level: level,
+            target_level: level + 1,
+            target,
+            base,
+        })
+    }
+
+    pub fn do_compaction(&self, meta: &mut FileMetaData) -> Result<Option<CompactionState>> {
+        let skip =
+            |internal_key: InternalKey| -> bool { self.smallest_sequence() > internal_key.seq() };
+
+        if let Some(c) = self.pick_compaction() {
+            let mut iters = vec![];
+            let mut files_iter = c.base.iter().chain(c.target.iter());
+            files_iter.try_for_each(|f| -> Result<()> {
+                let path = path_of_file(&self.opt.work_dir, f.number, Ext::SST);
+                let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path()))).unwrap();
+                let iter = TableIterator::new(Arc::new(t))?;
+                iters.push(iter);
+                Ok(())
+            })?;
+
+            meta.number = self.new_file_number();
+            let merge_iter = MergeIterator::new(iters);
+            let path = path_of_file(&self.opt.work_dir, meta.number, Ext::SST);
+
+            {
+                let mut tb = TableBuilder::new(
+                    self.opt.clone(),
+                    Box::new(WritableFileImpl::new(path.as_path())),
+                );
+                for e in merge_iter {
+                    if !skip(InternalKey::new(e.key.clone())) {
+                        tb.add(&e.key, &e.value)
+                    }
+                }
+                tb.finish_builder(meta)?;
+            }
+            return Ok(Some(c));
+        }
+        Ok(None)
     }
 }

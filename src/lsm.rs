@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::Error,
+    // io::Error,
     path::Path,
     sync::{
         mpsc::{sync_channel, SyncSender},
@@ -9,6 +9,7 @@ use std::{
     },
 };
 
+use anyhow::Ok;
 use bytes::BufMut;
 use parking_lot::RwLock;
 use tracing::info;
@@ -27,7 +28,7 @@ use crate::{
     Options,
 };
 
-type Result<T> = core::result::Result<T, Error>;
+type Result<T> = anyhow::Result<T, anyhow::Error>;
 
 struct MemInner {
     mem: Arc<MemTable>,
@@ -66,13 +67,6 @@ impl LsmInner {
         let next_file_id = version.new_file_number();
         Self {
             mem_inner: Arc::new(RwLock::new(MemInner::new(opt.clone(), next_file_id))),
-            // mem: Arc::new(MemTable::new()),
-            // imms: VecDeque::new(),
-            // wal: Writer::new(WritableFileImpl::new(&path_of_file(
-            //     &opt.work_dir,
-            //     next_file_id,
-            //     Ext::WAL,
-            // ))),
             version,
             opt,
         }
@@ -151,11 +145,14 @@ impl LsmInner {
                 return Ok(Some(result.to_vec()));
             }
         }
-        // TODO: search sst
+        // search sst
         let current = self.version.current();
+        current.refs();
         if let Some(result) = current.get(self.opt.clone(), key, seq) {
+            current.derefs();
             return Ok(Some(result.to_vec()));
         }
+        current.derefs();
         Ok(None)
     }
     fn write_wal(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
@@ -170,7 +167,6 @@ impl LsmInner {
             inner.wal.add_recore(&data)
         }
     }
-    #[allow(dead_code)]
     pub fn compact_mem_table(&self) {
         // write to disk
         // remove files
@@ -186,6 +182,7 @@ impl LsmInner {
             log_number = inner.logs[0];
             // inner.bitset.set(1, false);
         }
+        base.refs();
         self.write_level0_table(base, imm, log_number);
         {
             let mut inner = self.mem_inner.write();
@@ -194,7 +191,43 @@ impl LsmInner {
         }
     }
 
-    #[allow(dead_code)]
+    pub fn major_compaction(&self) -> Result<()> {
+        let current = self.version.current();
+        current.refs();
+        let mut file_meta = FileMetaData::new(0);
+        if let Some(c) = self.version.do_compaction(&mut file_meta)? {
+            let mut edit = VersionEdit::new();
+            c.base
+                .iter()
+                .for_each(|f| edit.delete_file(c.base_level as u32, f.clone()));
+            c.target
+                .iter()
+                .for_each(|f| edit.delete_file(c.target_level as u32, f.clone()));
+
+            edit.add_file(c.target_level as u32, file_meta);
+
+            let inner = self.mem_inner.read();
+            edit.log_number(inner.logs[0] - 1);
+            current.derefs();
+            self.version.log_and_apply(edit).unwrap();
+
+            // delete files
+            let mut compacted = vec![];
+            c.base
+                .iter()
+                .chain(c.target.iter())
+                .try_for_each(|f| -> Result<()> {
+                    compacted.push(format!("{:05}.sst", f.number));
+                    let path = path_of_file(&self.opt.work_dir.clone(), f.number(), Ext::SST);
+                    std::fs::remove_file(path.as_path())?;
+                    Ok(())
+                })?;
+            info!("Major compact {:?} to level {}", compacted, c.target_level);
+        }
+
+        Ok(())
+    }
+
     fn write_level0_table(&self, version: Arc<Version>, imm: Arc<MemTable>, log_number: u64) {
         {
             // let inner = self.mem_inner.read();
@@ -219,8 +252,12 @@ impl LsmInner {
             );
 
             // let fid = self.version.new_file_number();
-            edit.add_file(level, fid, file_meta.smallest(), file_meta.largest());
+            // edit.add_file(level, fid, file_meta.smallest(), file_meta.largest());
+            file_meta.number = fid;
+            edit.add_file(level, file_meta);
             edit.log_number(log_number);
+            version.derefs();
+
             self.version.log_and_apply(edit).unwrap();
             // delete wal file
             let wal_path = path_of_file(&self.opt.work_dir, log_number, Ext::WAL);
@@ -259,10 +296,16 @@ impl Lsm {
     }
 
     pub fn delete(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        if let Some(tx) = self.bg_tx.clone() {
+            tx.send(())?;
+        }
         self.inner.delete(key, value)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        if let Some(tx) = self.bg_tx.clone() {
+            tx.send(())?;
+        }
         self.inner.put(key, value)
     }
 
@@ -270,7 +313,7 @@ impl Lsm {
         self.inner.get(key)
     }
     fn run_bg_task(&self) -> SyncSender<()> {
-        let (tx, rx) = sync_channel(1);
+        let (tx, rx) = sync_channel(100);
         // Compactor::new(Arc::clone(&self.inner));
         // Arc::clone(&self.inner);
         // self.bg_tx = tx;
@@ -287,7 +330,7 @@ impl Lsm {
 
 #[cfg(test)]
 mod lsm_test {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
     use crate::Options;
 
@@ -305,9 +348,10 @@ mod lsm_test {
         };
         let lsm = Arc::new(Lsm::open(opt));
 
+        let mut handles = vec![];
         for _ in 0..10 {
             let lsm = Arc::clone(&lsm);
-            std::thread::spawn(move || {
+            let t = std::thread::spawn(move || {
                 for i in 100..200 {
                     let n = i as u32;
                     lsm.put(&n.to_be_bytes(), &n.to_be_bytes()).unwrap();
@@ -317,9 +361,10 @@ mod lsm_test {
                     assert_eq!(res.unwrap(), n.to_be_bytes());
                 }
             });
+            handles.push(t);
         }
 
-        for i in 0..100 {
+        for i in 0..200 {
             let n = i as u32;
             lsm.put(&n.to_be_bytes(), &n.to_be_bytes()).unwrap();
             let n = i as u32;
@@ -327,7 +372,12 @@ mod lsm_test {
             assert_ne!(res, None);
             assert_eq!(res.unwrap(), n.to_be_bytes());
         }
-        std::thread::sleep(Duration::from_secs(10));
+
+        while !handles.is_empty() {
+            if let Some(h) = handles.pop() {
+                h.join().unwrap();
+            }
+        }
         for i in 0..200 {
             let n = i as u32;
             let res = lsm.get(&n.to_be_bytes()).unwrap();

@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{Error, Write};
+use std::os::unix::prelude::MetadataExt;
 use std::path::Path;
 
 use super::Writable;
@@ -21,6 +22,10 @@ impl Writable for WritableFileImpl {
 
     fn sync(&mut self) -> Result<(), Error> {
         self.file.sync_all()
+    }
+
+    fn size(&self) -> Result<u64, Error> {
+        Ok(self.file.metadata()?.size())
     }
 }
 impl WritableFileImpl {

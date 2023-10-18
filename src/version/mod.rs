@@ -6,10 +6,10 @@ pub mod version_set;
 #[derive(Debug, Clone, Default)]
 pub struct FileMetaData {
     // refs: i32,
-    number: u64,
-    file_size: u64,        // File size in bytes
-    smallest: InternalKey, // Smallest internal key served by table
-    largest: InternalKey,  // Largest internal key served by table
+    pub number: u64,
+    pub file_size: u64,        // File size in bytes
+    pub smallest: InternalKey, // Smallest internal key served by table
+    pub largest: InternalKey,  // Largest internal key served by table
 }
 
 impl FileMetaData {
@@ -70,6 +70,7 @@ impl FileMetaData {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.put_u64(self.number);
+        buf.put_u64(self.file_size);
         buf.put_u32(self.smallest.len());
         buf.put(self.smallest.key().as_slice());
         buf.put_u32(self.largest.len());

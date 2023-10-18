@@ -31,6 +31,8 @@ pub trait Writable: Sync + Send + 'static {
     /// This function will attempt to ensure that all in-memory data reaches the
     /// filesystem before returning.
     fn sync(&mut self) -> Result<(), Error>;
+
+    fn size(&self) -> Result<u64, Error>;
 }
 
 pub enum Ext {

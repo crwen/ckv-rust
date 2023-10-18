@@ -1,6 +1,12 @@
 use bytes::BufMut;
 
-use super::{FileMetaData, InternalKey};
+use super::FileMetaData;
+
+// enum Tag {
+//     LogNumber,
+//     NextFileNumber,
+//     SeqNumber,
+// }
 
 #[derive(Clone)]
 pub struct TableMeta {
@@ -30,6 +36,8 @@ pub struct VersionEdit {
     pub delete_files: Vec<TableMeta>,
     pub add_files: Vec<TableMeta>,
     pub log_number: u64,
+    pub next_file_number: u64,
+    pub last_seq_number: u64,
 }
 
 impl VersionEdit {
@@ -40,11 +48,15 @@ impl VersionEdit {
             delete_files: Vec::new(),
             add_files: Vec::new(),
             log_number: 0,
+            next_file_number: 0,
+            last_seq_number: 0,
         }
     }
 
     pub fn encode(&self, buf: &mut Vec<u8>) {
         buf.put_u64(self.log_number);
+        buf.put_u64(self.next_file_number);
+        buf.put_u64(self.last_seq_number);
         self.add_files.iter().for_each(|f| f.encode(buf));
         self.delete_files.iter().for_each(|f| f.encode(buf));
     }
@@ -53,21 +65,22 @@ impl VersionEdit {
         self.log_number = number;
     }
 
-    pub fn add_file(
-        &mut self,
-        level: u32,
-        fid: u64,
-        smallest: &InternalKey,
-        largest: &InternalKey,
-    ) {
-        let f = FileMetaData::with_internal_range(fid, smallest.clone(), largest.clone());
+    pub fn next_file_number(&mut self, next_file_number: u64) {
+        self.next_file_number = next_file_number;
+    }
 
-        let table_meta = TableMeta::new(f, level);
+    pub fn last_seq_number(&mut self, last_seq_number: u64) {
+        self.log_number = last_seq_number;
+    }
+
+    pub fn add_file(&mut self, level: u32, file_meta: FileMetaData) {
+        // let f = FileMetaData::with_internal_range(fid, table_meta.smallest.clone(), table_meta.largest.clone());
+
+        let table_meta = TableMeta::new(file_meta, level);
         self.add_files.push(table_meta);
     }
-    pub fn delete_file(&mut self, level: u32, fid: u64, smallest: &[u8], largest: &[u8]) {
-        let f = FileMetaData::with_range(fid, smallest, largest);
-        let table_meta = TableMeta::new(f, level);
+    pub fn delete_file(&mut self, level: u32, file_meta: FileMetaData) {
+        let table_meta = TableMeta::new(file_meta, level);
         self.delete_files.push(table_meta);
     }
 }

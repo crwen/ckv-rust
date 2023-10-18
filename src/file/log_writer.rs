@@ -28,7 +28,7 @@ impl Writer {
         }
     }
 
-    pub fn add_recore(&self, data: &[u8]) -> Result<(), Error> {
+    pub fn add_recore(&self, data: &[u8]) -> Result<(), anyhow::Error> {
         let checksum = calculate_checksum(data);
         let mut buf = Vec::new();
         buf.put_u64(checksum);
