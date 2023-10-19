@@ -210,14 +210,13 @@ impl LsmInner {
             self.version.log_and_apply(edit).unwrap();
 
             // delete files
+            self.version.remove_ssts()?;
             let mut compacted = vec![];
             c.base
                 .iter()
                 .chain(c.target.iter())
                 .try_for_each(|f| -> Result<()> {
                     compacted.push(format!("{:05}.sst", f.number));
-                    let path = path_of_file(&self.opt.work_dir.clone(), f.number(), Ext::SST);
-                    std::fs::remove_file(path.as_path())?;
                     Ok(())
                 })?;
             info!("Major compact {:?} to level {}", compacted, c.target_level);
@@ -384,6 +383,5 @@ mod lsm_test {
             assert_ne!(res, None);
             assert_eq!(res.unwrap(), n.to_be_bytes());
         }
-        panic!("te")
     }
 }

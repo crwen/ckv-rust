@@ -340,20 +340,10 @@ impl VersionSet {
         versions.push_back(Arc::new(current));
         base.derefs();
 
-        // if base.refs_cnt() != 0 {
-        //     // panic!("ref cnt != 0");
-        //     println!(
-        //         "ref count {}, {}",
-        //         base.refs_cnt(),
-        //         Arc::strong_count(&base)
-        //     );
-        // }
-
         while let Some(v) = versions.front() {
             // remove useless version
             if v.refs_cnt() == 0 {
                 versions.pop_front();
-                // println!("pop version . count after  pop {}", versions.len());
             } else {
                 break;
             }
