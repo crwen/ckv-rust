@@ -1,7 +1,5 @@
 use std::{
     collections::VecDeque,
-    fs,
-    // io::Error,
     path::Path,
     sync::{
         mpsc::{sync_channel, SyncSender},
@@ -223,6 +221,8 @@ impl LsmInner {
                     Ok(())
                 })?;
             info!("Major compact {:?} to level {}", compacted, c.target_level);
+        } else {
+            current.derefs();
         }
 
         Ok(())
@@ -279,7 +279,7 @@ impl Lsm {
     pub fn open(opt: Options) -> Self {
         let path = Path::new(&opt.work_dir);
         if !path.exists() {
-            fs::create_dir(path).expect("create work direction fail!");
+            std::fs::create_dir(path).expect("create work direction fail!");
         }
 
         let mut lsm = Self {
@@ -384,5 +384,6 @@ mod lsm_test {
             assert_ne!(res, None);
             assert_eq!(res.unwrap(), n.to_be_bytes());
         }
+        panic!("te")
     }
 }

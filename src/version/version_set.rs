@@ -340,10 +340,20 @@ impl VersionSet {
         versions.push_back(Arc::new(current));
         base.derefs();
 
+        // if base.refs_cnt() != 0 {
+        //     // panic!("ref cnt != 0");
+        //     println!(
+        //         "ref count {}, {}",
+        //         base.refs_cnt(),
+        //         Arc::strong_count(&base)
+        //     );
+        // }
+
         while let Some(v) = versions.front() {
             // remove useless version
             if v.refs_cnt() == 0 {
                 versions.pop_front();
+                // println!("pop version . count after  pop {}", versions.len());
             } else {
                 break;
             }
@@ -429,5 +439,36 @@ impl VersionSet {
             return Ok(Some(c));
         }
         Ok(None)
+    }
+
+    pub fn remove_ssts(&self) -> Result<()> {
+        let versions = self.versions.read();
+        let mut lives = HashSet::new();
+        let mut deletes = HashSet::new();
+        versions.iter().for_each(|v| {
+            v.files.iter().for_each(|files| {
+                files.iter().for_each(|f| {
+                    lives.insert(f.number);
+                })
+            })
+        });
+        let dir = std::fs::read_dir(Path::new(&self.opt.work_dir))?;
+        for dir_entry in dir {
+            if let Some(file_name) = dir_entry?.file_name().to_str() {
+                if let Some((name, ext)) = file_name.split_once('.') {
+                    let fid = name.parse::<u64>()?;
+                    if ext == "sst" && !lives.contains(&fid) {
+                        deletes.insert(fid);
+                    }
+                }
+            }
+        }
+
+        deletes.iter().try_for_each(|fid| -> Result<()> {
+            let path = path_of_file(&self.opt.work_dir, *fid, Ext::SST);
+            std::fs::remove_file(path.as_path())?;
+            Ok(())
+        })?;
+        Ok(())
     }
 }
