@@ -13,6 +13,8 @@ use bytes::BufMut;
 use parking_lot::RwLock;
 
 use crate::{
+    cache::table_cache::TableCache,
+    // cache::lru::LRUCache,
     compactor::CompactionState,
     file::{
         log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext, RandomAccessFileImpl,
@@ -36,25 +38,26 @@ const L0_COMPACTION_TRIGGER: u32 = 4;
 const L1_COMPACTION_TRIGGER: f64 = 1048576.0;
 // const L1_COMPACTION_TRIGGER: f64 = 100.0;
 
-#[derive(Default, Debug)]
 pub struct Version {
     files: Vec<Vec<FileMetaData>>,
     refs: AtomicU32,
     smallest_sequence: u64,
+    table_cache: Arc<TableCache>,
 }
 
 impl Version {
-    pub fn new() -> Self {
+    pub fn new(table_cache: Arc<TableCache>) -> Self {
         let mut files: Vec<Vec<FileMetaData>> = Vec::new();
         files.resize_with(7, std::vec::Vec::new);
         Self {
             files,
             refs: AtomicU32::new(1),
             smallest_sequence: 0,
+            table_cache,
         }
     }
 
-    pub fn build(version: Arc<Version>, edit: &VersionEdit) -> Self {
+    pub fn build(table_cache: Arc<TableCache>, version: Arc<Version>, edit: &VersionEdit) -> Self {
         let mut files = version.files.clone();
 
         for f in edit.add_files.iter() {
@@ -78,6 +81,7 @@ impl Version {
             files,
             refs: AtomicU32::new(1),
             smallest_sequence: edit.last_seq_number,
+            table_cache,
         }
     }
 
@@ -137,8 +141,9 @@ impl Version {
                     // tmp.sort_by(|a, b| a.number.partial_cmp(&b.number).unwrap());
                     tmp.sort_by(|a, b| a.number.cmp(&b.number));
                     for f in tmp.iter() {
-                        let path = path_of_file(&opt.work_dir, f.number, Ext::SST);
-                        let entry = self.search_sst(&path, &internal_key.clone());
+                        // let path = path_of_file(&opt.work_dir, f.number, Ext::SST);
+                        // let entry = self.search_sst(&path, &internal_key.clone());
+                        let entry = self.search_sst(&opt, f.number, &internal_key.clone());
                         if entry.is_none() {
                             continue;
                         }
@@ -156,8 +161,9 @@ impl Version {
                     f.smallest.user_key() <= user_key && f.largest.user_key() >= user_key
                 });
                 if let Some(f) = f {
-                    let path = path_of_file(&opt.work_dir, f.number, Ext::SST);
-                    let entry = self.search_sst(path.as_path(), &internal_key.clone());
+                    // let path = path_of_file(&opt.work_dir, f.number, Ext::SST);
+                    // let entry = self.search_sst(path.as_path(), &internal_key.clone());
+                    let entry = self.search_sst(&opt, f.number, &internal_key.clone());
                     if let Some(e) = entry {
                         return Some(e.value);
                     }
@@ -167,9 +173,22 @@ impl Version {
         None
     }
 
-    fn search_sst(&self, path: &Path, internal_key: &[u8]) -> Option<Entry> {
-        let t = Table::new(Box::new(RandomAccessFileImpl::open(path))).unwrap();
-        t.internal_get(internal_key)
+    fn search_sst(&self, opt: &Options, fid: u64, internal_key: &[u8]) -> Option<Entry> {
+        let res = match self.table_cache.get(&fid) {
+            Some(t) => t.internal_get(internal_key),
+            None => {
+                let path = path_of_file(&opt.work_dir, fid, Ext::SST);
+                let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path()))).unwrap();
+                let res = t.internal_get(internal_key);
+                let _e = self.table_cache.insert(fid, Arc::new(t));
+                res
+            }
+        };
+        self.table_cache.unpin(&fid).unwrap();
+        res
+        // let path = path_of_file(&opt.work_dir, fid, Ext::SST);
+        // let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path()))).unwrap();
+        // t.internal_get(internal_key)
     }
 
     pub fn pick_level_for_mem_table_output(&self, smallest: &[u8], largest: &[u8]) -> u32 {
@@ -265,6 +284,7 @@ pub struct VersionSet {
     next_file_number: AtomicU64,
     #[allow(dead_code)]
     log_file: Writer,
+    table_cache: Arc<TableCache>,
     opt: Options,
 }
 
@@ -281,8 +301,9 @@ struct VersionSetInner {
 
 impl VersionSet {
     pub fn new(opt: Options) -> Self {
+        let table_cache = Arc::new(TableCache::with_capacity(1 << 22));
         let mut versions = LinkedList::new();
-        versions.push_back(Arc::new(Version::new()));
+        versions.push_back(Arc::new(Version::new(table_cache.clone())));
         Self {
             versions: Arc::new(RwLock::new(versions)),
             next_file_number: AtomicU64::new(0),
@@ -292,6 +313,7 @@ impl VersionSet {
                 0,
                 Ext::MANIFEST,
             ))),
+            table_cache,
             opt,
         }
     }
@@ -336,7 +358,7 @@ impl VersionSet {
 
         // modify memory metadata
         let base = versions.back().unwrap().clone();
-        let current = Version::build(base.clone(), &edit);
+        let current = Version::build(Arc::clone(&self.table_cache), base.clone(), &edit);
         versions.push_back(Arc::new(current));
         base.derefs();
 
@@ -404,7 +426,7 @@ impl VersionSet {
             let mut files_iter = c.base.iter().chain(c.target.iter());
             files_iter.try_for_each(|f| -> Result<()> {
                 let path = path_of_file(&self.opt.work_dir, f.number, Ext::SST);
-                let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path()))).unwrap();
+                let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path())))?;
                 let iter = TableIterator::new(Arc::new(t))?;
                 iters.push(iter);
                 Ok(())

@@ -18,10 +18,11 @@ pub struct Table {
     smallest: InternalKey,
     #[allow(dead_code)]
     largest: InternalKey,
+    file_sz: u64,
 }
 
 impl Table {
-    pub fn new(file: Box<dyn RandomAccess>) -> Result<Self> {
+    pub fn new(file: Box<dyn RandomAccess>) -> anyhow::Result<Self, anyhow::Error> {
         let mut footer = vec![0_u8; 8];
         let sz = file.size().unwrap();
         file.read(&mut footer, sz - 8).unwrap();
@@ -31,6 +32,7 @@ impl Table {
         let mut index_data = vec![0_u8; index_sz as usize + BLOCK_TRAILER_SIZE_];
         file.read(&mut index_data, index_offset as u64).unwrap();
         let index_block = Block::decode(&index_data);
+        let file_sz = file.size()?;
 
         Ok(Self {
             // file_opt,
@@ -38,7 +40,12 @@ impl Table {
             index_block,
             smallest: InternalKey::new(vec![]),
             largest: InternalKey::new(vec![]),
+            file_sz,
         })
+    }
+
+    pub fn size(&self) -> u64 {
+        self.file_sz
     }
 
     pub fn internal_get(&self, internal_key: &[u8]) -> Option<Entry> {

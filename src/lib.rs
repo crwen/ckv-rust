@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod compactor;
 pub mod file;
 pub mod lsm;
