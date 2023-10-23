@@ -2,12 +2,37 @@ use std::sync::Arc;
 
 use bytes::Buf;
 
-use crate::{file::RandomAccess, utils::Entry, version::InternalKey};
+use crate::{
+    file::RandomAccess,
+    utils::{bloom::BloomFilter, Entry, FilterPolicy},
+    version::InternalKey,
+};
 
 use super::{
     block::{Block, BlockHandler, BlockIterator, BLOCK_TRAILER_SIZE_},
     Result,
 };
+
+struct Footer {
+    filter_handler: BlockHandler,
+    index_handler: BlockHandler,
+}
+
+impl Footer {
+    fn decode(data: &[u8]) -> Self {
+        let mut filter_handler = BlockHandler::new();
+        filter_handler.set_offset((&data[0..4]).get_u32());
+        filter_handler.set_block_size((&data[4..8]).get_u32());
+
+        let mut index_handler = BlockHandler::new();
+        index_handler.set_offset((&data[8..12]).get_u32());
+        index_handler.set_block_size((&data[12..]).get_u32());
+        Self {
+            filter_handler,
+            index_handler,
+        }
+    }
+}
 
 pub struct Table {
     // #[allow(unused)]
@@ -19,20 +44,30 @@ pub struct Table {
     #[allow(dead_code)]
     largest: InternalKey,
     file_sz: u64,
+    bloom: BloomFilter,
+    filter_data: Vec<u8>,
 }
 
 impl Table {
     pub fn new(file: Box<dyn RandomAccess>) -> anyhow::Result<Self, anyhow::Error> {
-        let mut footer = vec![0_u8; 8];
+        // read footer
+        let mut footer = vec![0_u8; 16];
         let sz = file.size().unwrap();
-        file.read(&mut footer, sz - 8).unwrap();
-        let index_offset = (&footer[..4]).get_u32();
-        let index_sz = (&footer[4..]).get_u32();
+        file.read(&mut footer, sz - 16).unwrap();
+        let footer = Footer::decode(&footer);
 
-        let mut index_data = vec![0_u8; index_sz as usize + BLOCK_TRAILER_SIZE_];
-        file.read(&mut index_data, index_offset as u64).unwrap();
+        // read index
+        let mut index_data =
+            vec![0_u8; footer.index_handler.block_size() as usize + BLOCK_TRAILER_SIZE_];
+        file.read(&mut index_data, footer.index_handler.offset() as u64)
+            .unwrap();
         let index_block = Block::decode(&index_data);
         let file_sz = file.size()?;
+
+        // read filter
+        let mut filter_data = vec![0_u8; footer.filter_handler.block_size() as usize];
+        file.read(&mut filter_data, footer.filter_handler.offset() as u64)
+            .unwrap();
 
         Ok(Self {
             // file_opt,
@@ -41,6 +76,8 @@ impl Table {
             smallest: InternalKey::new(vec![]),
             largest: InternalKey::new(vec![]),
             file_sz,
+            bloom: BloomFilter::new(BloomFilter::bits_per_key(1999, 0.1)),
+            filter_data,
         })
     }
 
@@ -49,6 +86,10 @@ impl Table {
     }
 
     pub fn internal_get(&self, internal_key: &[u8]) -> Option<Entry> {
+        let target = InternalKey::new(internal_key.to_vec());
+        if !self.bloom.may_contain(&self.filter_data, target.user_key()) {
+            return None;
+        }
         // find data block first
         let mut index_iter = BlockIterator::new(Arc::new(self.index_block.clone()));
         let res = index_iter.seek(internal_key);
@@ -178,11 +219,9 @@ mod table_test {
             mem.put(e);
         }
 
-        let opt = Options {
-            block_size: 4096,
-            work_dir: "work_dir/table".to_string(),
-            mem_size: 4096,
-        };
+        let opt = Options::default_opt()
+            .work_dir("work_dir/table")
+            .mem_size(4096 * 2);
         let path = path_of_file(&opt.work_dir, 1, Ext::SST);
         if std::fs::metadata(&opt.work_dir).is_ok() {
             std::fs::remove_dir_all(&opt.work_dir).unwrap();

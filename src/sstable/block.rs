@@ -234,11 +234,9 @@ mod block_test {
             mem.put(e);
         }
 
-        let opt = Options {
-            block_size: 4096 * 2,
-            work_dir: "work_dir/block".to_string(),
-            mem_size: 4096,
-        };
+        let opt = Options::default_opt()
+            .work_dir("work_dir/block")
+            .block_size(4096 * 2);
         let path = path_of_file(&opt.work_dir, 1, Ext::SST);
         if std::fs::metadata(&opt.work_dir).is_ok() {
             std::fs::remove_dir_all(&opt.work_dir).unwrap();
@@ -260,11 +258,14 @@ mod block_test {
         file.read_to_end(&mut buf).unwrap();
 
         let len = buf.len();
-        (&buf[len - 4..]).get_u32();
-        let index_offset: u32 = (&buf[len - 8..]).get_u32();
-        // let checksum = buf[len-8..]
+        (&buf[len - 4..]).get_u32(); // index block size
+        let _index_offset: u32 = (&buf[len - 8..]).get_u32(); // index block offset
+        (&buf[len - 12..]).get_u32(); // filter block size
+        let filter_offset: u32 = (&buf[len - 16..]).get_u32(); // filter block offset
+                                                               // let checksum = buf[len-8..]
 
-        let block = Block::decode(&buf[..index_offset as usize]);
+        let block = Block::decode(&buf[..filter_offset as usize]);
+        // let block = Block::decode(&buf[..index_offset as usize]);
         let iter = BlockIterator::new(Arc::new(block));
         let mut count = 0;
         for (_, ele) in iter.enumerate() {

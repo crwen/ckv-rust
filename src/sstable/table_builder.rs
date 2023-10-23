@@ -2,6 +2,7 @@ use std::{io::Error, path::Path};
 
 use crate::{
     file::{writeable::WritableFileImpl, Writable},
+    filter::{bloom::BloomFilter, FilterPolicy},
     utils::Entry,
     version::{FileMetaData, InternalKey},
     Options,
@@ -12,6 +13,7 @@ use super::{block::BlockHandler, block_builder::BlockBuilder};
 enum BlockType {
     DataBlock,
     IndexBlock,
+    FilterBlock,
 }
 /// A block builder
 pub struct TableBuilder {
@@ -25,6 +27,8 @@ pub struct TableBuilder {
     pending_index_entry: bool,
     largest: InternalKey,
     smallest: InternalKey,
+    filters_keys: Vec<Vec<u8>>,
+    filters: Vec<u8>,
 }
 
 impl TableBuilder {
@@ -40,6 +44,8 @@ impl TableBuilder {
             pending_index_entry: false,
             largest: InternalKey::new(vec![]),
             smallest: InternalKey::new(vec![]),
+            filters_keys: Vec::new(),
+            filters: Vec::new(),
         }
     }
 
@@ -85,6 +91,9 @@ impl TableBuilder {
             self.pending_index_entry = false;
         }
 
+        let internal_key = InternalKey::new(key.to_vec());
+        self.filters_keys.push(internal_key.user_key().to_vec());
+
         self.last_key = key.to_vec();
         self.data_block.add(key, value);
 
@@ -104,6 +113,7 @@ impl TableBuilder {
         let content = match block_type {
             BlockType::DataBlock => self.data_block.finish(),
             BlockType::IndexBlock => self.index_block.finish(),
+            BlockType::FilterBlock => &self.filters,
         };
 
         self.pending_handler.set_offset(self.offset);
@@ -115,6 +125,10 @@ impl TableBuilder {
         match block_type {
             BlockType::DataBlock => self.data_block.reset(),
             BlockType::IndexBlock => self.index_block.reset(),
+            BlockType::FilterBlock => {
+                self.filters_keys = vec![];
+                self.filters = vec![];
+            }
         };
     }
 
@@ -131,17 +145,31 @@ impl TableBuilder {
         // write last data block
         self.flush();
 
-        // TODO: write filter block
-
         // write index block
         if self.pending_index_entry {
             let handler = self.pending_handler.to_vec();
             self.index_block.add(&self.last_key, &handler);
             self.pending_index_entry = false;
         }
+
+        let bloom = BloomFilter::new(BloomFilter::bits_per_key(
+            self.filters_keys.len() as u32,
+            0.1,
+        ));
+
+        // write filter block
+        self.filters = bloom.create_filter(&self.filters_keys);
+        let mut filter_handler = BlockHandler::new();
+        filter_handler.set_offset(self.offset);
+        filter_handler.set_block_size(self.filters.len() as u32);
+
+        self.write_block(BlockType::FilterBlock);
+
+        // write index block
         self.write_block(BlockType::IndexBlock);
 
         // write footer
+        self.file.append(&filter_handler.to_vec()).unwrap();
         self.file.append(&self.pending_handler.to_vec()).unwrap();
     }
 }
@@ -175,11 +203,7 @@ mod builder_test {
             mem.put(e);
         }
 
-        let opt = Options {
-            block_size: 4096,
-            work_dir: "work_dir/table_builder".to_string(),
-            mem_size: 4096,
-        };
+        let opt = Options::default_opt().work_dir("work_dir/table_builder");
         let path = path_of_file(&opt.work_dir, 10, Ext::SST);
 
         if std::fs::metadata(&opt.work_dir).is_ok() {

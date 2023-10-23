@@ -1,3 +1,4 @@
+pub mod bloom;
 pub mod codec;
 pub mod convert;
 
@@ -27,4 +28,10 @@ impl Entry {
     pub fn seq(&self) -> u64 {
         self.seq
     }
+}
+
+pub trait FilterPolicy: Send + Sync {
+    fn may_contain(&self, filter: &[u8], key: &[u8]) -> bool;
+
+    fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
 }
