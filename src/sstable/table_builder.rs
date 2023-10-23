@@ -2,8 +2,7 @@ use std::{io::Error, path::Path};
 
 use crate::{
     file::{writeable::WritableFileImpl, Writable},
-    filter::{bloom::BloomFilter, FilterPolicy},
-    utils::Entry,
+    utils::{bloom::BloomFilter, Entry, FilterPolicy},
     version::{FileMetaData, InternalKey},
     Options,
 };
