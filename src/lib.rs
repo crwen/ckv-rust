@@ -1,7 +1,6 @@
 pub mod cache;
 pub mod compactor;
 pub mod file;
-pub mod filter;
 pub mod lsm;
 pub mod mem_table;
 pub mod sstable;
