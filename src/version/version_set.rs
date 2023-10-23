@@ -1,5 +1,6 @@
 use std::{
     collections::{HashSet, LinkedList},
+    io::ErrorKind,
     // io::Error,
     path::Path,
     sync::{
@@ -17,8 +18,8 @@ use crate::{
     // cache::lru::LRUCache,
     compactor::CompactionState,
     file::{
-        log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext, RandomAccessFileImpl,
-        Writable,
+        log_reader::Reader, log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext,
+        RandomAccessFileImpl, SequentialFileImpl, Writable,
     },
     sstable::{
         merge::MergeIterator,
@@ -42,6 +43,7 @@ pub struct Version {
     files: Vec<Vec<FileMetaData>>,
     refs: AtomicU32,
     smallest_sequence: u64,
+    smallest_log_number: u64,
     table_cache: Arc<TableCache>,
 }
 
@@ -53,6 +55,7 @@ impl Version {
             files,
             refs: AtomicU32::new(1),
             smallest_sequence: 0,
+            smallest_log_number: 0,
             table_cache,
         }
     }
@@ -81,6 +84,7 @@ impl Version {
             files,
             refs: AtomicU32::new(1),
             smallest_sequence: edit.last_seq_number,
+            smallest_log_number: edit.log_number,
             table_cache,
         }
     }
@@ -99,6 +103,9 @@ impl Version {
 
     pub fn smallest_sequence(&self) -> u64 {
         self.smallest_sequence
+    }
+    pub fn smallest_log_number(&self) -> u64 {
+        self.smallest_log_number
     }
 
     pub fn files(&self) -> &Vec<Vec<FileMetaData>> {
@@ -302,8 +309,8 @@ struct VersionSetInner {
 impl VersionSet {
     pub fn new(opt: Options) -> Self {
         let table_cache = Arc::new(TableCache::with_capacity(1 << 22));
-        let mut versions = LinkedList::new();
-        versions.push_back(Arc::new(Version::new(table_cache.clone())));
+        let versions = LinkedList::new();
+        // versions.push_back(Arc::new(Version::new(table_cache.clone())));
         Self {
             versions: Arc::new(RwLock::new(versions)),
             next_file_number: AtomicU64::new(0),
@@ -328,6 +335,11 @@ impl VersionSet {
         versions.front().unwrap().smallest_sequence()
     }
 
+    pub fn smallest_log_number(&self) -> u64 {
+        let versions = self.versions.read();
+        versions.front().unwrap().smallest_log_number()
+    }
+
     pub fn new_file_number(&self) -> u64 {
         self.next_file_number.fetch_add(1, Ordering::SeqCst)
     }
@@ -339,11 +351,6 @@ impl VersionSet {
     pub fn add_last_sequence(&self, n: u64) -> u64 {
         self.last_sequence.fetch_add(n, Ordering::SeqCst)
     }
-
-    // pub fn pick_level_for_mem_table_output(&self, smallest: &[u8], largest: &[u8]) -> u32 {
-    //     self.current()
-    //         .pick_level_for_mem_table_output(smallest, largest)
-    // }
 
     pub fn log_and_apply(&self, mut edit: VersionEdit) -> Result<()> {
         // write manifest
@@ -441,9 +448,12 @@ impl VersionSet {
                     self.opt.clone(),
                     Box::new(WritableFileImpl::new(path.as_path())),
                 );
+                let mut last_key = InternalKey::new(vec![]);
                 for e in merge_iter {
-                    if !skip(InternalKey::new(e.key.clone())) {
-                        tb.add(&e.key, &e.value)
+                    let key = InternalKey::new(e.key.clone());
+                    if !(key == last_key && skip(InternalKey::new(e.key.clone()))) {
+                        last_key = key;
+                        tb.add(&e.key, &e.value);
                     }
                 }
                 tb.finish_builder(meta)?;
@@ -481,6 +491,64 @@ impl VersionSet {
             std::fs::remove_file(path.as_path())?;
             Ok(())
         })?;
+        Ok(())
+    }
+
+    pub fn recover(&self) -> Result<()> {
+        let mut f = Reader::new(Box::new(SequentialFileImpl::new(
+            path_of_file(&self.opt.work_dir, 0, Ext::MANIFEST).as_path(),
+        )));
+        let mut edit = VersionEdit::new();
+        let mut add_files = vec![];
+        let mut delete_files = vec![];
+        let mut delete_set = HashSet::new();
+        let mut log_number = 0;
+        let mut last_seq_number = 0;
+        let mut next_file_number = 0;
+
+        let mut end = false;
+        while !end {
+            let record = f.read_record();
+            match record {
+                core::result::Result::Ok(record) => {
+                    let t_edit = VersionEdit::decode(&record);
+                    t_edit
+                        .add_files
+                        .iter()
+                        .for_each(|f| add_files.push(f.clone()));
+                    t_edit.delete_files.iter().for_each(|f| {
+                        delete_files.push(f.clone());
+                        delete_set.insert(f.file_meta.number);
+                    });
+
+                    log_number = log_number.max(t_edit.log_number);
+                    last_seq_number = last_seq_number.max(t_edit.last_seq_number);
+                    next_file_number = next_file_number.max(t_edit.next_file_number);
+                    edit.next_file_number(t_edit.next_file_number);
+                }
+                Err(err) => match err.kind() {
+                    ErrorKind::UnexpectedEof => end = true,
+                    err => panic!("{:?}", err),
+                },
+            };
+        }
+        add_files
+            .iter()
+            .filter(|f| !delete_set.contains(&f.file_meta.number))
+            .for_each(|f| edit.add_files.push(f.clone()));
+        edit.log_number(log_number);
+        edit.last_seq_number(last_seq_number);
+        edit.next_file_number(next_file_number);
+
+        let base = Version::new(Arc::clone(&self.table_cache));
+        let ver = Version::build(Arc::clone(&self.table_cache), Arc::new(base), &edit);
+
+        let mut versions = self.versions.write();
+        versions.push_back(Arc::new(ver));
+        self.add_last_sequence(last_seq_number);
+        self.next_file_number
+            .fetch_add(next_file_number, Ordering::SeqCst);
+
         Ok(())
     }
 }

@@ -41,19 +41,15 @@ mod log_reader_test {
             codec::{decode_varintu32, varintu32_length},
             Entry,
         },
-        Options,
     };
 
     use super::Reader;
 
     #[test]
     fn log_reader_test() {
-        let opt = Options {
-            block_size: 4096,
-            work_dir: String::from("work_dir/log"),
-            mem_size: 4096,
-        };
-        let path = path_of_file(&opt.work_dir, 0, Ext::WAL);
+        let opt = crate::Options::default_opt().work_dir("work_dir/log");
+
+        let path = path_of_file(&opt.work_dir, 1, Ext::WAL);
 
         if std::fs::metadata(&opt.work_dir).is_ok() {
             std::fs::remove_dir_all(&opt.work_dir).unwrap()

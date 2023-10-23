@@ -77,6 +77,20 @@ impl FileMetaData {
         buf.put(self.largest.key().as_slice());
         buf
     }
+    pub fn decode(data: &[u8]) -> Self {
+        let number = (&data[..8]).get_u64();
+        let file_size = (&data[8..16]).get_u64();
+        let smallest_sz = (&data[16..20]).get_u32();
+        let smallest = data[20..20 + smallest_sz as usize].to_vec();
+        let _largest_sz = (&data[20 + smallest_sz as usize..]).get_u32();
+        let largest = data[24 + smallest_sz as usize..].to_vec();
+        Self {
+            number,
+            file_size,
+            smallest: InternalKey::new(smallest),
+            largest: InternalKey::new(largest),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Default)]

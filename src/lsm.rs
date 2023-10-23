@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    io::ErrorKind,
     path::Path,
     sync::{
         mpsc::{sync_channel, SyncSender},
@@ -8,16 +9,22 @@ use std::{
 };
 
 use anyhow::Ok;
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use parking_lot::RwLock;
 use tracing::info;
 
 use crate::{
     compactor::Compactor,
-    file::{log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext},
+    file::{
+        log_reader::Reader, log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext,
+        SequentialFileImpl,
+    },
     mem_table::{MemTable, MemTableIterator},
     sstable::table_builder::TableBuilder,
-    utils::{codec::encode_varintu32, Entry},
+    utils::{
+        codec::{decode_varintu32, encode_varintu32, varintu32_length},
+        Entry, OP_TYPE_PUT,
+    },
     version::{
         version_edit::VersionEdit,
         version_set::{Version, VersionSet},
@@ -37,8 +44,8 @@ struct MemInner {
 
 impl MemInner {
     fn new(opt: Options, next_file_id: u64) -> Self {
-        let mut logs = VecDeque::new();
-        logs.push_back(next_file_id);
+        let logs = VecDeque::new();
+        // logs.push_back(next_file_id);
         Self {
             // mem_inner: Arc::new(RwLock::new(Arc::new(MemInner::new(opt.clone(), new_fid)))),
             mem: Arc::new(MemTable::new()),
@@ -202,7 +209,7 @@ impl LsmInner {
                 .iter()
                 .for_each(|f| edit.delete_file(c.target_level as u32, f.clone()));
 
-            edit.add_file(c.target_level as u32, file_meta);
+            edit.add_file(c.target_level as u32, file_meta.clone());
 
             let inner = self.mem_inner.read();
             edit.log_number(inner.logs[0] - 1);
@@ -265,6 +272,87 @@ impl LsmInner {
             info!("Minor compact {:05}.sst to level {:?}", fid, level);
         }
     }
+    fn recover(&self) -> Result<()> {
+        // recover from manifest
+        self.version.recover()?;
+        self.recover_mem()?;
+
+        self.version.remove_ssts()?;
+        Ok(())
+    }
+
+    fn recover_mem(&self) -> Result<()> {
+        let mut wal_count = 0;
+        let mut seq = 0_u64;
+        {
+            let mut inner = self.mem_inner.write();
+
+            let log_number = self.version.smallest_log_number();
+            let dir = std::fs::read_dir(Path::new(&self.opt.work_dir))?;
+            for dir_entry in dir {
+                if let Some(file_name) = dir_entry?.file_name().to_str() {
+                    if let Some((name, ext)) = file_name.split_once('.') {
+                        let fid = name.parse::<u64>()?;
+                        if ext == "wal" {
+                            if fid > log_number {
+                                let mut f = Reader::new(Box::new(SequentialFileImpl::new(
+                                    path_of_file(&self.opt.work_dir, fid, Ext::WAL).as_path(),
+                                )));
+
+                                let mut end = false;
+                                while !end {
+                                    let record = f.read_record();
+                                    match record {
+                                        core::result::Result::Ok(record) => {
+                                            seq = seq.max((&record[..8]).get_u64());
+                                            let data = &record[8..];
+                                            let key_sz = decode_varintu32(data).unwrap();
+                                            let var_key_sz = varintu32_length(key_sz) as usize;
+                                            let key =
+                                                &data[var_key_sz..var_key_sz + key_sz as usize];
+                                            let value = &data[var_key_sz + key_sz as usize..];
+                                            inner.mem.set(
+                                                Entry::new(key.to_vec(), value.to_vec(), seq),
+                                                OP_TYPE_PUT,
+                                            );
+                                        }
+                                        Err(err) => match err.kind() {
+                                            ErrorKind::UnexpectedEof => end = true,
+                                            err => panic!("{:?}", err),
+                                        },
+                                    };
+                                }
+                                let imm =
+                                    std::mem::replace(&mut inner.mem, Arc::new(MemTable::new()));
+                                inner.imms.push_back(imm);
+                                inner.logs.push_back(fid);
+                                wal_count += 1;
+                            } else {
+                                let path = path_of_file(&self.opt.work_dir, fid, Ext::WAL);
+                                std::fs::remove_file(path.as_path())?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for _ in 0..wal_count {
+            self.compact_mem_table();
+        }
+
+        let mut inner = self.mem_inner.write();
+        let next_file_id = self.version.new_file_number();
+        inner.logs.push_back(next_file_id);
+        let wal = Writer::new(WritableFileImpl::new(
+            path_of_file(&self.opt.work_dir, next_file_id, Ext::WAL).as_path(),
+        ));
+        let _ = std::mem::replace(&mut inner.wal, wal);
+
+        let vseq = self.version.last_sequence();
+        self.version.add_last_sequence(seq.abs_diff(vseq));
+
+        Ok(())
+    }
 }
 
 pub struct Lsm {
@@ -290,6 +378,7 @@ impl Lsm {
             bg_tx: None,
             // opt,
         };
+        lsm.inner.recover().unwrap();
         lsm.bg_tx = lsm.run_bg_task().into();
         lsm
     }
@@ -312,7 +401,7 @@ impl Lsm {
         self.inner.get(key)
     }
     fn run_bg_task(&self) -> SyncSender<()> {
-        let (tx, rx) = sync_channel(100);
+        let (tx, rx) = sync_channel(10000);
         // Compactor::new(Arc::clone(&self.inner));
         // Arc::clone(&self.inner);
         // self.bg_tx = tx;
@@ -335,13 +424,8 @@ mod lsm_test {
 
     use super::Lsm;
 
-    #[test]
-    fn lsm_crud_test() {
-        let opt = Options {
-            block_size: 1 << 12,
-            work_dir: "work_dir/lsm".to_string(),
-            mem_size: 1 << 12,
-        };
+    fn crud() {
+        let opt = Options::default_opt().work_dir("work_dir/lsm");
         if std::fs::metadata(&opt.work_dir).is_ok() {
             std::fs::remove_dir_all(&opt.work_dir).unwrap()
         };
@@ -382,6 +466,68 @@ mod lsm_test {
             let res = lsm.get(&n.to_be_bytes()).unwrap();
             assert_ne!(res, None);
             assert_eq!(res.unwrap(), n.to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn lsm_crud_test() {
+        crud();
+    }
+
+    #[test]
+    fn lsm_recover_test() {
+        {
+            let opt = Options::default_opt().work_dir("work_dir/recovery");
+            if std::fs::metadata(&opt.work_dir).is_ok() {
+                std::fs::remove_dir_all(&opt.work_dir).unwrap()
+            };
+            let lsm = Arc::new(Lsm::open(opt));
+
+            let mut handles = vec![];
+            for _ in 0..10 {
+                let lsm = Arc::clone(&lsm);
+                let t = std::thread::spawn(move || {
+                    for i in 100..200 {
+                        let n = i as u32;
+                        lsm.put(&n.to_be_bytes(), &n.to_be_bytes()).unwrap();
+                        let n = i as u32;
+                        let res = lsm.get(&n.to_be_bytes()).unwrap();
+                        assert_ne!(res, None);
+                        assert_eq!(res.unwrap(), n.to_be_bytes());
+                    }
+                });
+                handles.push(t);
+            }
+
+            for i in 0..200 {
+                let n = i as u32;
+                lsm.put(&n.to_be_bytes(), &n.to_be_bytes()).unwrap();
+                let n = i as u32;
+                let res = lsm.get(&n.to_be_bytes()).unwrap();
+                assert_ne!(res, None);
+                assert_eq!(res.unwrap(), n.to_be_bytes());
+            }
+
+            while !handles.is_empty() {
+                if let Some(h) = handles.pop() {
+                    h.join().unwrap();
+                }
+            }
+            for i in 0..200 {
+                let n = i as u32;
+                let res = lsm.get(&n.to_be_bytes()).unwrap();
+                assert_ne!(res, None);
+                assert_eq!(res.unwrap(), n.to_be_bytes());
+            }
+        }
+        let opt = Options::default_opt().work_dir("work_dir/recovery");
+        let lsm = Arc::new(Lsm::open(opt));
+        //
+        for i in 0..200 {
+            let n = i as u32;
+            let res = lsm.get(&n.to_be_bytes()).unwrap();
+            assert_ne!(res, None);
+            assert_eq!(res.clone().unwrap(), n.to_be_bytes());
         }
     }
 }

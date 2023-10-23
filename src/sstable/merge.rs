@@ -66,11 +66,7 @@ mod merge_test {
 
     #[test]
     fn seq_merge_test() {
-        let opt = Options {
-            block_size: 1 << 12,
-            work_dir: "work_dir/merge".to_string(),
-            mem_size: 1 << 10,
-        };
+        let opt = Options::default_opt().work_dir("work_dir/merge");
         if std::fs::metadata(&opt.work_dir).is_ok() {
             std::fs::remove_dir_all(&opt.work_dir).unwrap()
         };
