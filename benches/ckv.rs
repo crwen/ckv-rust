@@ -28,22 +28,37 @@ fn random(n: u32) -> u32 {
     })
 }
 
-fn set_benchmark(c: &mut Criterion) {
+fn random_data() -> Vec<u8> {
     const SIZE: u32 = 65536;
-    let opt = ckv::Options::default_opt().work_dir("work_dir/bench");
+    const REPEAT: u32 = 18;
+    let repeat = random(REPEAT);
+    let mut data = vec![];
+    for _ in 0..repeat {
+        data.append(&mut random(SIZE).to_be_bytes().to_vec());
+    }
+    data
+}
+
+fn set_benchmark(c: &mut Criterion) {
+    let opt = ckv::Options::default_opt()
+        .work_dir("work_dir/bench")
+        .mem_size(1 << 20)
+        .cache_size(1 << 24)
+        .kv_separate_threshold(64);
     if std::fs::metadata(&opt.work_dir).is_ok() {
         std::fs::remove_dir_all(&opt.work_dir).unwrap()
     };
     let lsm = Lsm::open(opt);
     c.bench_function("set", |b| {
         b.iter(|| {
-            lsm.put(&random(SIZE).to_be_bytes(), &random(SIZE).to_be_bytes())
-                .unwrap();
+            // lsm.put(&random(SIZE).to_be_bytes(), &random(SIZE).to_be_bytes())
+            //     .unwrap();
+            lsm.put(&random_data(), &random_data()).unwrap();
         })
     });
     c.bench_function("get", |b| {
         b.iter(|| {
-            lsm.get(&random(SIZE).to_be_bytes()).unwrap();
+            lsm.get(&random_data()).unwrap();
         })
     });
 }

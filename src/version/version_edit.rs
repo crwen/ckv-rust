@@ -54,6 +54,8 @@ pub struct VersionEdit {
     // next_file_number: u64,
     pub delete_files: Vec<TableMeta>,
     pub add_files: Vec<TableMeta>,
+    pub add_vlogs: Vec<u64>,
+    pub delete_vlogs: Vec<u64>,
     pub log_number: u64,
     pub next_file_number: u64,
     pub last_seq_number: u64,
@@ -66,6 +68,8 @@ impl VersionEdit {
             // next_file_number: 0,
             delete_files: Vec::new(),
             add_files: Vec::new(),
+            add_vlogs: Vec::new(),
+            delete_vlogs: Vec::new(),
             log_number: 0,
             next_file_number: 0,
             last_seq_number: 0,
@@ -86,6 +90,8 @@ impl VersionEdit {
             log_number,
             next_file_number,
             last_seq_number,
+            add_vlogs: Vec::new(),
+            delete_vlogs: Vec::new(),
         }
     }
 

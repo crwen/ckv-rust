@@ -1,7 +1,9 @@
 use std::{io::Error, path::Path};
 
+use bytes::BufMut;
+
 use crate::{
-    file::{writeable::WritableFileImpl, Writable},
+    file::{log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext, Writable},
     utils::{bloom::BloomFilter, Entry, FilterPolicy},
     version::{FileMetaData, InternalKey},
     Options,
@@ -10,14 +12,17 @@ use crate::{
 use super::{block::BlockHandler, block_builder::BlockBuilder};
 
 enum BlockType {
-    DataBlock,
-    IndexBlock,
-    FilterBlock,
+    Data,
+    Index,
+    Filter,
 }
 /// A block builder
 pub struct TableBuilder {
     file_opt: Options,
+    #[allow(unused)]
+    fid: u64,
     file: Box<dyn Writable>,
+    vlog: Option<Writer>,
     data_block: BlockBuilder,
     index_block: BlockBuilder,
     offset: u32,
@@ -31,20 +36,22 @@ pub struct TableBuilder {
 }
 
 impl TableBuilder {
-    pub fn new(file_opt: Options, file: Box<dyn Writable>) -> Self {
+    pub fn new(file_opt: Options, file: Box<dyn Writable>, fid: u64) -> Self {
         TableBuilder {
-            file_opt,
             pending_handler: BlockHandler::new(),
             data_block: BlockBuilder::new(),
             index_block: BlockBuilder::new(),
             offset: 0,
             file,
+            vlog: None,
+            fid,
             last_key: Vec::new(),
             pending_index_entry: false,
             largest: InternalKey::new(vec![]),
             smallest: InternalKey::new(vec![]),
             filters_keys: Vec::new(),
             filters: Vec::new(),
+            file_opt,
         }
     }
 
@@ -53,19 +60,39 @@ impl TableBuilder {
         opt: Options,
         iter: T,
         meta: &mut FileMetaData,
-    ) -> Result<(), Error>
+    ) -> Result<(), anyhow::Error>
     where
         T: Iterator<Item = Entry>,
     {
         // let (mut largest, mut smallest) = (InternalKey::new(vec![]), InternalKey::new(vec![]));
-        let mut tb = TableBuilder::new(opt, Box::new(WritableFileImpl::new(path)));
+        let fid = meta.number;
+        let mut tb = TableBuilder::new(opt, Box::new(WritableFileImpl::new(path)), fid);
 
         iter.for_each(|e| {
-            // if smallest.is_empty() {
-            //     smallest = InternalKey::new(e.key.to_vec());
-            // }
-            // largest = InternalKey::new(e.key.to_vec());
-            tb.add(&e.key, &e.value);
+            let mut value_wrapper = vec![];
+            if !e.value.is_empty() && e.value.len() >= tb.file_opt.kv_separate_threshold {
+                if tb.vlog.is_none() {
+                    tb.vlog = Some(Writer::new(WritableFileImpl::new(&path_of_file(
+                        &tb.file_opt.work_dir.clone(),
+                        fid,
+                        Ext::VLOG,
+                    ))));
+                    meta.vlogs.push(fid);
+                }
+                let off = tb.vlog.as_ref().unwrap().offset();
+                tb.vlog
+                    .as_ref()
+                    .unwrap()
+                    .add_recore(&e.value)
+                    .expect("write vlog failed!");
+                value_wrapper.put_u8(1);
+                value_wrapper.put_u64(fid);
+                value_wrapper.put_u64(off);
+            } else {
+                value_wrapper.put_u8(0);
+                value_wrapper.put_slice(&e.value);
+            }
+            tb.add(&e.key, &value_wrapper);
         });
 
         tb.finish();
@@ -97,22 +124,22 @@ impl TableBuilder {
         self.data_block.add(key, value);
 
         let estimated_size = self.data_block.estimated_size();
-        if estimated_size > self.file_opt.block_size {
+        if estimated_size >= self.file_opt.block_size {
             self.flush();
         }
     }
 
     fn flush(&mut self) {
-        self.write_block(BlockType::DataBlock);
+        self.write_block(BlockType::Data);
         self.pending_index_entry = true;
         self.file.flush().unwrap();
     }
 
     fn write_block(&mut self, block_type: BlockType) {
         let content = match block_type {
-            BlockType::DataBlock => self.data_block.finish(),
-            BlockType::IndexBlock => self.index_block.finish(),
-            BlockType::FilterBlock => &self.filters,
+            BlockType::Data => self.data_block.finish(),
+            BlockType::Index => self.index_block.finish(),
+            BlockType::Filter => &self.filters,
         };
 
         self.pending_handler.set_offset(self.offset);
@@ -122,9 +149,9 @@ impl TableBuilder {
         self.offset += content.len() as u32;
         self.file.append(content).unwrap();
         match block_type {
-            BlockType::DataBlock => self.data_block.reset(),
-            BlockType::IndexBlock => self.index_block.reset(),
-            BlockType::FilterBlock => {
+            BlockType::Data => self.data_block.reset(),
+            BlockType::Index => self.index_block.reset(),
+            BlockType::Filter => {
                 self.filters_keys = vec![];
                 self.filters = vec![];
             }
@@ -162,10 +189,10 @@ impl TableBuilder {
         filter_handler.set_offset(self.offset);
         filter_handler.set_block_size(self.filters.len() as u32);
 
-        self.write_block(BlockType::FilterBlock);
+        self.write_block(BlockType::Filter);
 
         // write index block
-        self.write_block(BlockType::IndexBlock);
+        self.write_block(BlockType::Index);
 
         // write footer
         self.file.append(&filter_handler.to_vec()).unwrap();
@@ -249,7 +276,7 @@ mod builder_test {
                 let expected_key = mem_entry.key;
                 let expected_value = i.to_be_bytes();
                 assert_eq!(e.key, expected_key);
-                assert_eq!(e.value, expected_value);
+                assert_eq!(e.value[1..], expected_value);
                 i += 1;
                 lkey = expected_key.to_vec();
             });

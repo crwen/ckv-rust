@@ -44,6 +44,10 @@ impl Writer {
         Ok(())
     }
 
+    pub fn offset(&self) -> u64 {
+        self.inner.lock().offset
+    }
+
     pub fn flush(&mut self) -> Result<(), Error> {
         let mut inner = self.inner.lock();
         inner.file.flush()?;

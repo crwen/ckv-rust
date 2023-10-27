@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, LinkedList},
+    collections::{HashMap, HashSet, LinkedList},
     io::ErrorKind,
     // io::Error,
     path::Path,
@@ -10,16 +10,19 @@ use std::{
 };
 
 use anyhow::Ok;
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 use parking_lot::RwLock;
 
 use crate::{
     cache::table_cache::TableCache,
     // cache::lru::LRUCache,
-    compactor::CompactionState,
+    compactor::{CompactionState, GCState},
     file::{
-        log_reader::Reader, log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext,
-        RandomAccessFileImpl, SequentialFileImpl, Writable,
+        log_reader::{RandomReader, Reader},
+        log_writer::Writer,
+        path_of_file,
+        writeable::WritableFileImpl,
+        Ext, RandomAccessFileImpl, SequentialFileImpl, Writable,
     },
     sstable::{
         merge::MergeIterator,
@@ -182,16 +185,16 @@ impl Version {
 
     fn search_sst(&self, opt: &Options, fid: u64, internal_key: &[u8]) -> Option<Entry> {
         let res = match self.table_cache.get(&fid) {
-            Some(t) => t.internal_get(internal_key),
+            Some(t) => t.internal_get(opt, internal_key),
             None => {
                 let path = path_of_file(&opt.work_dir, fid, Ext::SST);
                 let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path()))).unwrap();
-                let res = t.internal_get(internal_key);
+                let res = t.internal_get(opt, internal_key);
                 let _e = self.table_cache.insert(fid, Arc::new(t));
                 res
             }
         };
-        self.table_cache.unpin(&fid).unwrap();
+
         res
         // let path = path_of_file(&opt.work_dir, fid, Ext::SST);
         // let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path()))).unwrap();
@@ -442,21 +445,60 @@ impl VersionSet {
             meta.number = self.new_file_number();
             let merge_iter = MergeIterator::new(iters);
             let path = path_of_file(&self.opt.work_dir, meta.number, Ext::SST);
+            let mut vlog_cache = HashMap::<u64, RandomReader>::new();
+            let mut vlog = None;
 
             {
                 let mut tb = TableBuilder::new(
                     self.opt.clone(),
                     Box::new(WritableFileImpl::new(path.as_path())),
+                    meta.number,
                 );
                 let mut last_key = InternalKey::new(vec![]);
                 for e in merge_iter {
                     let key = InternalKey::new(e.key.clone());
                     if !(key == last_key && skip(InternalKey::new(e.key.clone()))) {
                         last_key = key;
-                        tb.add(&e.key, &e.value);
+                        let mut value = e.value.clone();
+                        // if c.target_level >= 0 && !value.is_empty() && value[0] == 1 {
+                        if !value.is_empty() && value[0] == 1 {
+                            // do vlog merge on last two level
+
+                            // read value in vlog
+                            let fid = (&value[1..9]).get_u64();
+                            let offset = (&value[9..17]).get_u64();
+                            let log = vlog_cache.entry(fid).or_insert_with(|| {
+                                let path =
+                                    path_of_file(&self.opt.work_dir, fid, crate::file::Ext::VLOG);
+                                RandomReader::new(Box::new(RandomAccessFileImpl::open(
+                                    path.as_path(),
+                                )))
+                            });
+                            let ivalue = log.read_record(offset).unwrap();
+
+                            let vwriter = vlog.get_or_insert(Writer::new(WritableFileImpl::new(
+                                &path_of_file(&self.opt.work_dir, meta.number, Ext::VLOG),
+                            )));
+                            // construct value in sst
+                            let off = vwriter.offset();
+                            value.clear();
+                            value.put_u8(1);
+                            value.put_u64(meta.number);
+                            value.put_u64(off);
+
+                            vwriter.add_recore(&ivalue)?;
+                        }
+                        tb.add(&e.key, &value);
                     }
                 }
                 tb.finish_builder(meta)?;
+                if vlog.is_none() {
+                    c.base.iter().chain(c.target.iter()).for_each(|f| {
+                        meta.vlogs.append(&mut f.vlogs.clone());
+                    });
+                } else {
+                    meta.vlogs.push(meta.number);
+                }
             }
             return Ok(Some(c));
         }
@@ -466,11 +508,16 @@ impl VersionSet {
     pub fn remove_ssts(&self) -> Result<()> {
         let versions = self.versions.read();
         let mut lives = HashSet::new();
+        let mut lives_vlog = HashSet::new();
         let mut deletes = HashSet::new();
+        let mut deletes_vlog = HashSet::new();
         versions.iter().for_each(|v| {
             v.files.iter().for_each(|files| {
                 files.iter().for_each(|f| {
                     lives.insert(f.number);
+                    f.vlogs.iter().for_each(|v| {
+                        lives_vlog.insert(v);
+                    });
                 })
             })
         });
@@ -481,6 +528,8 @@ impl VersionSet {
                     let fid = name.parse::<u64>()?;
                     if ext == "sst" && !lives.contains(&fid) {
                         deletes.insert(fid);
+                    } else if ext == "vlog" && !lives_vlog.contains(&fid) {
+                        deletes_vlog.insert(fid);
                     }
                 }
             }
@@ -488,6 +537,11 @@ impl VersionSet {
 
         deletes.iter().try_for_each(|fid| -> Result<()> {
             let path = path_of_file(&self.opt.work_dir, *fid, Ext::SST);
+            std::fs::remove_file(path.as_path())?;
+            Ok(())
+        })?;
+        deletes_vlog.iter().try_for_each(|fid| -> Result<()> {
+            let path = path_of_file(&self.opt.work_dir, *fid, Ext::VLOG);
             std::fs::remove_file(path.as_path())?;
             Ok(())
         })?;
@@ -550,5 +604,88 @@ impl VersionSet {
             .fetch_add(next_file_number, Ordering::SeqCst);
 
         Ok(())
+    }
+
+    pub fn do_gc(&self, meta: &mut FileMetaData) -> Result<Option<GCState>> {
+        let current = self.current();
+        let mut target_level = 0;
+        let mut target_fid = 0;
+        let mut target_sz = 0;
+        let mut target_meta = FileMetaData::new(0);
+
+        // pick a sstable to gc
+        current
+            .files
+            .iter()
+            .rev()
+            .enumerate()
+            .for_each(|(level, files)| {
+                files.iter().for_each(|f| {
+                    if target_sz < f.vlogs.len() {
+                        target_sz = f.vlogs.len();
+                        target_fid = f.number;
+                        target_level = level;
+                        target_meta = f.clone();
+                    }
+                })
+            });
+
+        if target_sz < 2 {
+            return Ok(None);
+        }
+
+        let mut vlog_cache = HashMap::<u64, RandomReader>::new();
+        // don't use cache, because we only need to rewrite the sstable
+        let path = path_of_file(&self.opt.work_dir, target_fid, Ext::SST);
+        let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path())))?;
+
+        let new_fid = self.new_file_number();
+        let new_path = path_of_file(&self.opt.work_dir, new_fid, Ext::SST);
+        let mut tb = TableBuilder::new(
+            self.opt.clone(),
+            Box::new(WritableFileImpl::new(&new_path)),
+            new_fid,
+        );
+        let vlog_writer = Writer::new(WritableFileImpl::new(&path_of_file(
+            &self.opt.work_dir,
+            new_fid,
+            Ext::VLOG,
+        )));
+
+        let mut iter = TableIterator::new(Arc::new(t))?;
+        iter.try_for_each(|e| -> Result<()> {
+            let value = &e.value;
+            let mut value_wrapper = value.to_vec();
+
+            if !value.is_empty() && value[0] == 1 {
+                // value_ptr
+                let fid = (&value[1..9]).get_u64();
+                let offset = (&value[9..17]).get_u64();
+                let path = path_of_file(&self.opt.work_dir, fid, crate::file::Ext::VLOG);
+                let vlog = vlog_cache.entry(fid).or_insert_with(|| {
+                    RandomReader::new(Box::new(RandomAccessFileImpl::open(path.as_path())))
+                });
+
+                let ivalue = vlog.read_record(offset).unwrap();
+                let off = vlog_writer.offset();
+                value_wrapper.clear();
+                value_wrapper.put_u8(1);
+                value_wrapper.put_u64(new_fid);
+                value_wrapper.put_u64(off);
+
+                vlog_writer.add_recore(&ivalue)?;
+            }
+            tb.add(&e.key, &value_wrapper);
+            Ok(())
+        })?;
+        meta.number = new_fid;
+        meta.vlogs.push(new_fid);
+        tb.finish_builder(meta)?;
+
+        Ok(Some(GCState {
+            level: target_level,
+            rewrite_file: target_meta,
+            new_file: meta.clone(),
+        }))
     }
 }

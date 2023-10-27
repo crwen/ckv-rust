@@ -13,6 +13,7 @@ pub struct Options {
     pub work_dir: String,
     pub mem_size: usize,
     pub cache_size: usize,
+    kv_separate_threshold: usize,
 }
 
 impl Options {
@@ -22,6 +23,7 @@ impl Options {
             work_dir: "work_dir".to_string(),
             mem_size: 1 << 12,   // 4K
             cache_size: 1 << 22, // 4M
+            kv_separate_threshold: 128,
         }
     }
     pub fn mem_size(&mut self, mem_size: usize) -> Self {
@@ -41,6 +43,11 @@ impl Options {
 
     pub fn work_dir(&mut self, work_dir: &str) -> Self {
         self.work_dir = String::from(work_dir);
+        self.clone()
+    }
+
+    pub fn kv_separate_threshold(&mut self, kv_separate_threshold: usize) -> Self {
+        self.kv_separate_threshold = kv_separate_threshold;
         self.clone()
     }
 }

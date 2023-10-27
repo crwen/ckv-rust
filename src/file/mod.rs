@@ -38,6 +38,7 @@ pub trait Writable: Sync + Send + 'static {
 pub enum Ext {
     WAL,
     SST,
+    VLOG,
     MANIFEST,
 }
 
@@ -45,6 +46,7 @@ pub fn path_of_file(work_dir: &str, id: u64, ext: Ext) -> PathBuf {
     let file_ext = match ext {
         Ext::WAL => ".wal",
         Ext::SST => ".sst",
+        Ext::VLOG => ".vlog",
         Ext::MANIFEST => "",
     };
     if file_ext.is_empty() {

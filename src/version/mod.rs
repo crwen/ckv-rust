@@ -10,6 +10,7 @@ pub struct FileMetaData {
     pub file_size: u64,        // File size in bytes
     pub smallest: InternalKey, // Smallest internal key served by table
     pub largest: InternalKey,  // Largest internal key served by table
+    pub vlogs: Vec<u64>,
 }
 
 impl FileMetaData {
@@ -20,6 +21,7 @@ impl FileMetaData {
             file_size: 0,
             smallest: InternalKey::new(vec![]),
             largest: InternalKey::new(vec![]),
+            vlogs: Vec::new(),
         }
     }
 
@@ -30,6 +32,7 @@ impl FileMetaData {
             file_size: 0,
             smallest: InternalKey::new(smallest.to_vec()),
             largest: InternalKey::new(largest.to_vec()),
+            vlogs: Vec::new(),
         }
     }
 
@@ -40,6 +43,7 @@ impl FileMetaData {
             file_size: 0,
             smallest,
             largest,
+            vlogs: Vec::new(),
         }
     }
 
@@ -75,6 +79,10 @@ impl FileMetaData {
         buf.put(self.smallest.key().as_slice());
         buf.put_u32(self.largest.len());
         buf.put(self.largest.key().as_slice());
+        buf.put_u32(self.vlogs.len() as u32);
+        self.vlogs.iter().for_each(|fid| {
+            buf.put_u64(*fid);
+        });
         buf
     }
     pub fn decode(data: &[u8]) -> Self {
@@ -82,13 +90,25 @@ impl FileMetaData {
         let file_size = (&data[8..16]).get_u64();
         let smallest_sz = (&data[16..20]).get_u32();
         let smallest = data[20..20 + smallest_sz as usize].to_vec();
-        let _largest_sz = (&data[20 + smallest_sz as usize..]).get_u32();
-        let largest = data[24 + smallest_sz as usize..].to_vec();
+        let largest_sz = (&data[20 + smallest_sz as usize..]).get_u32();
+        let mut off = 24 + smallest_sz as usize;
+        let largest = data[off..off + largest_sz as usize].to_vec();
+        off += largest_sz as usize;
+        let vlen = (&data[off..]).get_u32();
+        off += 4;
+        let mut vlogs = vec![];
+        for _ in 0..vlen {
+            let fid = (&data[off..]).get_u64();
+            vlogs.push(fid);
+            off += 8;
+        }
+
         Self {
             number,
             file_size,
             smallest: InternalKey::new(smallest),
             largest: InternalKey::new(largest),
+            vlogs,
         }
     }
 }

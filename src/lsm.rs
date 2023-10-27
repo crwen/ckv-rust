@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    io::ErrorKind,
     path::Path,
     sync::{
         mpsc::{sync_channel, SyncSender},
@@ -234,12 +233,31 @@ impl LsmInner {
         Ok(())
     }
 
+    // pub fn gc(&self) -> Result<()> {
+    //     let current = self.version.current();
+    //     current.refs();
+    //     let mut file_meta = FileMetaData::new(0);
+    //     if let Some(state) = self.version.do_gc(&mut file_meta)? {
+    //         let mut edit = VersionEdit::new();
+    //         edit.add_file(state.level as u32, file_meta.clone());
+    //         edit.delete_file(state.level as u32, state.rewrite_file);
+    //         let inner = self.mem_inner.read();
+    //         edit.log_number(inner.logs[0] - 1);
+    //         current.derefs();
+    //
+    //         self.version.log_and_apply(edit).unwrap();
+    //         // self.version.remove_ssts()?;
+    //     } else {
+    //         current.derefs();
+    //     }
+    //     Ok(())
+    // }
+
     fn write_level0_table(&self, version: Arc<Version>, imm: Arc<MemTable>, log_number: u64) {
         {
             // let inner = self.mem_inner.read();
             let mut edit = VersionEdit::new();
             let fid = self.version.new_file_number();
-            // let fid = self.version.new_file_number();
             let mut file_meta = FileMetaData::new(fid);
             // imm  to sst
 
@@ -259,7 +277,7 @@ impl LsmInner {
 
             // let fid = self.version.new_file_number();
             // edit.add_file(level, fid, file_meta.smallest(), file_meta.largest());
-            file_meta.number = fid;
+            // file_meta.number = fid;
             edit.add_file(level, file_meta);
             edit.log_number(log_number);
             version.derefs();
@@ -311,13 +329,16 @@ impl LsmInner {
                                             let key =
                                                 &data[var_key_sz..var_key_sz + key_sz as usize];
                                             let value = &data[var_key_sz + key_sz as usize..];
+                                            let val_sz = decode_varintu32(value).unwrap();
+                                            let var_val_sz = varintu32_length(val_sz) as usize;
+                                            let value = &value[var_val_sz..];
                                             inner.mem.set(
                                                 Entry::new(key.to_vec(), value.to_vec(), seq),
                                                 OP_TYPE_PUT,
                                             );
                                         }
                                         Err(err) => match err.kind() {
-                                            ErrorKind::UnexpectedEof => end = true,
+                                            std::io::ErrorKind::UnexpectedEof => end = true,
                                             err => panic!("{:?}", err),
                                         },
                                     };
@@ -370,10 +391,6 @@ impl Lsm {
         }
 
         let mut lsm = Self {
-            // mem_inner: Arc::new(RwLock::new(Arc::new(MemInner::new(
-            //     opt.clone(),
-            //     next_file_id,
-            // )))),
             inner: Arc::new(LsmInner::new(opt.clone())),
             bg_tx: None,
             // opt,
@@ -384,14 +401,14 @@ impl Lsm {
     }
 
     pub fn delete(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if let Some(tx) = self.bg_tx.clone() {
+        if let Some(tx) = self.bg_tx.as_ref() {
             tx.send(())?;
         }
         self.inner.delete(key, value)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if let Some(tx) = self.bg_tx.clone() {
+        if let Some(tx) = self.bg_tx.as_ref() {
             tx.send(())?;
         }
         self.inner.put(key, value)
@@ -401,10 +418,7 @@ impl Lsm {
         self.inner.get(key)
     }
     fn run_bg_task(&self) -> SyncSender<()> {
-        let (tx, rx) = sync_channel(10000);
-        // Compactor::new(Arc::clone(&self.inner));
-        // Arc::clone(&self.inner);
-        // self.bg_tx = tx;
+        let (tx, rx) = sync_channel(1000);
         let db = self.inner.clone();
         std::thread::Builder::new()
             .name("bg".to_owned())
@@ -424,11 +438,7 @@ mod lsm_test {
 
     use super::Lsm;
 
-    fn crud() {
-        let opt = Options::default_opt().work_dir("work_dir/lsm");
-        if std::fs::metadata(&opt.work_dir).is_ok() {
-            std::fs::remove_dir_all(&opt.work_dir).unwrap()
-        };
+    fn crud(opt: Options) {
         let lsm = Arc::new(Lsm::open(opt));
 
         let mut handles = vec![];
@@ -471,55 +481,31 @@ mod lsm_test {
 
     #[test]
     fn lsm_crud_test() {
-        crud();
+        let opt = Options::default_opt()
+            .work_dir("work_dir/lsm")
+            .kv_separate_threshold(4);
+        // .kv_separate_threshold(4);
+        if std::fs::metadata(&opt.work_dir).is_ok() {
+            std::fs::remove_dir_all(&opt.work_dir).unwrap()
+        };
+        crud(opt);
     }
 
     #[test]
     fn lsm_recover_test() {
         {
-            let opt = Options::default_opt().work_dir("work_dir/recovery");
+            let opt = Options::default_opt()
+                .work_dir("work_dir/recovery")
+                .kv_separate_threshold(4);
+            // .kv_separate_threshold(4);
             if std::fs::metadata(&opt.work_dir).is_ok() {
                 std::fs::remove_dir_all(&opt.work_dir).unwrap()
             };
-            let lsm = Arc::new(Lsm::open(opt));
-
-            let mut handles = vec![];
-            for _ in 0..10 {
-                let lsm = Arc::clone(&lsm);
-                let t = std::thread::spawn(move || {
-                    for i in 100..200 {
-                        let n = i as u32;
-                        lsm.put(&n.to_be_bytes(), &n.to_be_bytes()).unwrap();
-                        let n = i as u32;
-                        let res = lsm.get(&n.to_be_bytes()).unwrap();
-                        assert_ne!(res, None);
-                        assert_eq!(res.unwrap(), n.to_be_bytes());
-                    }
-                });
-                handles.push(t);
-            }
-
-            for i in 0..200 {
-                let n = i as u32;
-                lsm.put(&n.to_be_bytes(), &n.to_be_bytes()).unwrap();
-                let n = i as u32;
-                let res = lsm.get(&n.to_be_bytes()).unwrap();
-                assert_ne!(res, None);
-                assert_eq!(res.unwrap(), n.to_be_bytes());
-            }
-
-            while !handles.is_empty() {
-                if let Some(h) = handles.pop() {
-                    h.join().unwrap();
-                }
-            }
-            for i in 0..200 {
-                let n = i as u32;
-                let res = lsm.get(&n.to_be_bytes()).unwrap();
-                assert_ne!(res, None);
-                assert_eq!(res.unwrap(), n.to_be_bytes());
-            }
+            crud(opt);
         }
+        // std::thread::sleep(std::time::Duration::from_secs(10));
+
+        // let opt = Options::default_opt().work_dir("work_dir/recovery");
         let opt = Options::default_opt().work_dir("work_dir/recovery");
         let lsm = Arc::new(Lsm::open(opt));
         //

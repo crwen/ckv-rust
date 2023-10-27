@@ -3,9 +3,10 @@ use std::sync::Arc;
 use bytes::Buf;
 
 use crate::{
-    file::RandomAccess,
+    file::{log_reader::RandomReader, path_of_file, RandomAccess, RandomAccessFileImpl},
     utils::{bloom::BloomFilter, Entry, FilterPolicy},
     version::InternalKey,
+    Options,
 };
 
 use super::{
@@ -85,7 +86,7 @@ impl Table {
         self.file_sz
     }
 
-    pub fn internal_get(&self, internal_key: &[u8]) -> Option<Entry> {
+    pub fn internal_get(&self, opt: &Options, internal_key: &[u8]) -> Option<Entry> {
         let target = InternalKey::new(internal_key.to_vec());
         if !self.bloom.may_contain(&self.filter_data, target.user_key()) {
             return None;
@@ -102,10 +103,22 @@ impl Table {
         let data_block = Arc::new(Block::decode(&data));
         let mut data_iter = BlockIterator::new(data_block);
 
-        if let Some(e) = data_iter.seek(internal_key) {
+        if let Some(mut e) = data_iter.seek(internal_key) {
             let found = InternalKey::new(e.clone().key);
             let target = InternalKey::new(internal_key.to_vec());
             if found.user_key() == target.user_key() {
+                let v = e.value.clone();
+                if !v.is_empty() && v[0] == 0 {
+                    e.value = v[1..].to_vec();
+                } else if !v.is_empty() {
+                    let fid = (&e.value[1..9]).get_u64();
+                    let offset = (&e.value[9..17]).get_u64();
+                    let path = path_of_file(&opt.work_dir, fid, crate::file::Ext::VLOG);
+                    let mut vlog =
+                        RandomReader::new(Box::new(RandomAccessFileImpl::open(path.as_path())));
+                    e.value = vlog.read_record(offset).unwrap();
+                }
+
                 Some(e)
             } else {
                 None
@@ -232,7 +245,7 @@ mod table_test {
         let mut file_meta = FileMetaData::new(1);
         TableBuilder::build_table(
             path.as_path(),
-            opt,
+            opt.clone(),
             MemTableIterator::new(&mem),
             &mut file_meta,
         )
@@ -243,7 +256,7 @@ mod table_test {
         for _ in 0..300 {
             let e = mem_iter.next().unwrap();
             let ikey = e.key;
-            let res = t.internal_get(&ikey);
+            let res = t.internal_get(&opt, &ikey);
             assert!(res.is_some());
             assert_eq!(res.clone().unwrap().key(), &ikey.to_vec());
             assert_eq!(res.unwrap().value(), &ikey[..4].to_vec());

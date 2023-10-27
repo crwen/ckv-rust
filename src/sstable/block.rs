@@ -279,7 +279,7 @@ mod block_test {
 
             // let expected_key = build_internal_key(&e, 0);
             assert_eq!(ele.key, e.key);
-            assert_eq!(ele.value, e.value);
+            assert_eq!(ele.value[1..], e.value);
         }
         assert_eq!(count, 300);
     }

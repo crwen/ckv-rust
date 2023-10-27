@@ -15,6 +15,11 @@ pub struct CompactionState {
     pub base: Vec<FileMetaData>,
     pub target: Vec<FileMetaData>,
 }
+pub struct GCState {
+    pub level: usize,
+    pub rewrite_file: FileMetaData,
+    pub new_file: FileMetaData,
+}
 
 pub struct Compactor {
     handle: Receiver<()>,
