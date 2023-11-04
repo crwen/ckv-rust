@@ -12,6 +12,7 @@ use std::{
 use anyhow::Ok;
 use bytes::{Buf, BufMut};
 use parking_lot::RwLock;
+use tracing::info;
 
 use crate::{
     cache::Cache,
@@ -602,9 +603,9 @@ impl VersionSet {
                     last_key = key;
                     // let mut value = e.value.clone();
                     let mut value = e.value.to_vec();
-                    // if c.target_level >= 0 && !value.is_empty() && value[0] == 1 {
-                    if !value.is_empty() && value[0] == 1 {
-                        // do vlog merge on last two level
+                    if c.base_level >= 1 && !value.is_empty() && value[0] == 1 {
+                        // if !value.is_empty() && value[0] == 1 {
+                        // do vlog merge on
 
                         // read value in vlog
                         let fid = (&value[1..9]).get_u64();
@@ -633,11 +634,23 @@ impl VersionSet {
             }
             tb.finish_builder(meta)?;
             if vlog.is_none() {
+                // no new vlog produce. merge vlogs that in CompactionState to new group
                 c.base.iter().chain(c.target.iter()).for_each(|f| {
                     meta.vlogs.append(&mut f.vlogs.clone());
                 });
             } else {
+                // only one vlog for sst. vlogs in CompactionState could be removed in the future
                 meta.vlogs.push(meta.number);
+                let mut drops = vec![];
+                c.base.iter().chain(c.target.iter()).for_each(|f| {
+                    drops.append(&mut f.vlogs.clone());
+                });
+                info!(
+                    "merge vlogs {:?} to {:?}.vlog -> level {}",
+                    drops,
+                    format!("{:05}.sst", meta.number),
+                    c.target_level
+                );
             }
         }
         Ok(Some(c))

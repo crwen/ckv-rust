@@ -284,14 +284,6 @@ impl LsmInner {
                 base.push(format!("{:05}.sst", b.number));
                 target.push(format!("{:05}.sst", t.number));
             }
-            // c.base
-            //     .iter()
-            //     .chain(c.target.iter())
-            //     .try_for_each(|f| -> Result<()> {
-            //         compacted.push(format!("{:05}.sst", f.number));
-            //         Ok(())
-            //     })?;
-            // info!("Seek compact {:?} to level {}", compacted, c.target_level);
             info!(
                 "Seek compact\n {:?},\n  {:?}\n to level {} {:?}",
                 base,
@@ -331,9 +323,6 @@ impl LsmInner {
                 file_meta.largest().user_key(),
             );
 
-            // let fid = self.version.new_file_number();
-            // edit.add_file(level, fid, file_meta.smallest(), file_meta.largest());
-            // file_meta.number = fid;
             edit.add_file(level, file_meta);
             edit.log_number(log_number);
             version.derefs();
@@ -543,7 +532,7 @@ mod lsm_test {
         for _ in 0..10 {
             let lsm = Arc::clone(&lsm);
             let t = std::thread::spawn(move || {
-                for i in 100..200 {
+                for i in 1000..2000 {
                     let n = i as u32;
                     lsm.put(&n.to_be_bytes(), &n.to_be_bytes()).unwrap();
                     let n = i as u32;
@@ -555,7 +544,7 @@ mod lsm_test {
             handles.push(t);
         }
 
-        for i in 0..200 {
+        for i in 0..2000 {
             let n = i as u32;
             lsm.put(&n.to_be_bytes(), &n.to_be_bytes()).unwrap();
             let n = i as u32;
@@ -569,7 +558,7 @@ mod lsm_test {
                 h.join().unwrap();
             }
         }
-        for i in 0..200 {
+        for i in 0..2000 {
             let n = i as u32;
             let res = lsm.get(&n.to_be_bytes()).unwrap();
             assert_ne!(res, None);
@@ -581,8 +570,8 @@ mod lsm_test {
     fn lsm_crud_test() {
         let opt = Options::default_opt()
             .work_dir("work_dir/lsm")
+            .mem_size(1 << 12)
             .kv_separate_threshold(4);
-        // .kv_separate_threshold(4);
         if std::fs::metadata(&opt.work_dir).is_ok() {
             std::fs::remove_dir_all(&opt.work_dir).unwrap()
         };
@@ -591,23 +580,28 @@ mod lsm_test {
 
     #[test]
     fn lsm_recover_test() {
-        {
+        std::thread::spawn(move || {
             let opt = Options::default_opt()
                 .work_dir("work_dir/recovery")
+                .mem_size(1 << 12)
                 .kv_separate_threshold(4);
             // .kv_separate_threshold(4);
             if std::fs::metadata(&opt.work_dir).is_ok() {
                 std::fs::remove_dir_all(&opt.work_dir).unwrap()
             };
             crud(opt);
-        }
-        // std::thread::sleep(std::time::Duration::from_secs(10));
+        })
+        .join()
+        .unwrap();
+
+        // wait to release resource
+        std::thread::sleep(std::time::Duration::from_secs(1));
 
         // let opt = Options::default_opt().work_dir("work_dir/recovery");
         let opt = Options::default_opt().work_dir("work_dir/recovery");
         let lsm = Arc::new(Lsm::open(opt));
         //
-        for i in 0..200 {
+        for i in 0..2000 {
             let n = i as u32;
             let res = lsm.get(&n.to_be_bytes()).unwrap();
             assert_ne!(res, None);
