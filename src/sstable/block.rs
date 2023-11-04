@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 
 use crate::utils::{
     codec::{decode_varintu32, varintu32_length, verify_checksum},
@@ -35,7 +35,7 @@ impl BlockHandler {
         self.block_size
     }
 
-    pub fn decode(data: &[u8]) -> Result<Self> {
+    pub fn decode(data: Bytes) -> Result<Self> {
         if data.len() < 8 {
             return Err(TableError::DecodeBlockHandlerError);
         }
@@ -67,7 +67,7 @@ impl BlockHandler {
 
 #[derive(Clone, Debug)]
 pub struct Block {
-    data: Vec<u8>,
+    data: Bytes,
     entry_offsets: Vec<u32>,
 }
 
@@ -81,7 +81,7 @@ impl Block {
         let num_offset = (&data[offset_end..]).get_u32();
         let data_end = offset_end - num_offset as usize * SIZEOF_U32;
         Self {
-            data: data[..data_end].to_vec(),
+            data: Bytes::from(data[..data_end].to_vec()),
             entry_offsets: data[data_end..offset_end]
                 .chunks(SIZEOF_U32)
                 .map(|mut x| x.get_u32())
@@ -108,7 +108,7 @@ impl Block {
         let value_sz = decode_varintu32(value_data).unwrap();
         let varint_value_sz = varintu32_length(key_sz) as usize;
         let value = value_data[varint_value_sz..varint_value_sz + value_sz as usize].to_vec();
-        Entry::new(key, value, 0)
+        Entry::new(Bytes::from(key), Bytes::from(value), 0)
     }
 
     // pub fn append(&mut self, data: &[u8]) {
@@ -209,7 +209,7 @@ impl Iterator for BlockIterator {
 mod block_test {
     use std::{io::Read, sync::Arc};
 
-    use bytes::Buf;
+    use bytes::{Buf, Bytes};
 
     use crate::{
         file::{path_of_file, Ext},
@@ -227,8 +227,8 @@ mod block_test {
         let mem = MemTable::new();
         for i in 0..300 {
             let e = Entry::new(
-                (i as u32).to_be_bytes().to_vec(),
-                (i as u32).to_be_bytes().to_vec(),
+                Bytes::from((i as u32).to_be_bytes().to_vec()),
+                Bytes::from((i as u32).to_be_bytes().to_vec()),
                 i,
             );
             mem.put(e);

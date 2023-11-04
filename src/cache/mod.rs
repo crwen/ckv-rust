@@ -1,4 +1,6 @@
-pub mod table_cache;
+mod table_cache;
+
+pub use table_cache::*;
 
 type Result<T> = anyhow::Result<T, CacheError>;
 

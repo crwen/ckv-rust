@@ -1,9 +1,14 @@
+use std::sync::atomic::AtomicU32;
+
 use bytes::{Buf, BufMut, Bytes};
 
-pub mod version_edit;
-pub mod version_set;
+mod version_edit;
+mod version_set;
 
-#[derive(Debug, Clone, Default)]
+pub use version_edit::*;
+pub use version_set::*;
+
+#[derive(Debug, Default)]
 pub struct FileMetaData {
     // refs: i32,
     pub number: u64,
@@ -11,6 +16,20 @@ pub struct FileMetaData {
     pub smallest: InternalKey, // Smallest internal key served by table
     pub largest: InternalKey,  // Largest internal key served by table
     pub vlogs: Vec<u64>,
+    pub allow_seek: AtomicU32,
+}
+
+impl Clone for FileMetaData {
+    fn clone(&self) -> Self {
+        Self {
+            number: self.number,
+            file_size: self.file_size,
+            smallest: self.smallest.clone(),
+            largest: self.largest.clone(),
+            vlogs: self.vlogs.clone(),
+            allow_seek: AtomicU32::new(self.allow_seek.load(std::sync::atomic::Ordering::SeqCst)),
+        }
+    }
 }
 
 impl FileMetaData {
@@ -19,9 +38,10 @@ impl FileMetaData {
             // refs: 0,
             number,
             file_size: 0,
-            smallest: InternalKey::new(vec![]),
-            largest: InternalKey::new(vec![]),
+            smallest: InternalKey::new(Bytes::new()),
+            largest: InternalKey::new(Bytes::new()),
             vlogs: Vec::new(),
+            allow_seek: AtomicU32::new(0),
         }
     }
 
@@ -30,9 +50,10 @@ impl FileMetaData {
             // refs: 0,
             number,
             file_size: 0,
-            smallest: InternalKey::new(smallest.to_vec()),
-            largest: InternalKey::new(largest.to_vec()),
+            smallest: InternalKey::new(Bytes::from(smallest.to_vec())),
+            largest: InternalKey::new(Bytes::from(largest.to_vec())),
             vlogs: Vec::new(),
+            allow_seek: AtomicU32::new(0),
         }
     }
 
@@ -44,11 +65,26 @@ impl FileMetaData {
             smallest,
             largest,
             vlogs: Vec::new(),
+            allow_seek: AtomicU32::new(0),
         }
     }
 
     pub fn set_file_size(&mut self, file_size: u64) {
         self.file_size = file_size;
+    }
+
+    pub fn increase_seek(&self) -> u32 {
+        self.allow_seek
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn allow_seek(&self) -> u32 {
+        self.allow_seek.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn allow_seek_reset(&self) {
+        self.allow_seek
+            .store(0, std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn number(&self) -> u64 {
@@ -76,9 +112,9 @@ impl FileMetaData {
         buf.put_u64(self.number);
         buf.put_u64(self.file_size);
         buf.put_u32(self.smallest.len());
-        buf.put(self.smallest.key().as_slice());
+        buf.put(self.smallest.key());
         buf.put_u32(self.largest.len());
-        buf.put(self.largest.key().as_slice());
+        buf.put(self.largest.key());
         buf.put_u32(self.vlogs.len() as u32);
         self.vlogs.iter().for_each(|fid| {
             buf.put_u64(*fid);
@@ -106,16 +142,17 @@ impl FileMetaData {
         Self {
             number,
             file_size,
-            smallest: InternalKey::new(smallest),
-            largest: InternalKey::new(largest),
+            smallest: InternalKey::new(Bytes::from(smallest)),
+            largest: InternalKey::new(Bytes::from(largest)),
             vlogs,
+            allow_seek: AtomicU32::new(0),
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct InternalKey {
-    key: Vec<u8>,
+    key: Bytes,
 }
 
 impl PartialOrd for InternalKey {
@@ -151,12 +188,20 @@ impl Ord for InternalKey {
     }
 }
 
+impl From<Vec<u8>> for InternalKey {
+    fn from(key: Vec<u8>) -> Self {
+        Self {
+            key: Bytes::from(key),
+        }
+    }
+}
+
 impl InternalKey {
-    pub fn new(key: Vec<u8>) -> Self {
+    pub fn new(key: Bytes) -> Self {
         Self { key }
     }
 
-    pub fn key(&self) -> Vec<u8> {
+    pub fn key(&self) -> Bytes {
         self.key.clone()
     }
 

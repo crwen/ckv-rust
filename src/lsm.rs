@@ -8,26 +8,21 @@ use std::{
 };
 
 use anyhow::Ok;
-use bytes::{Buf, BufMut};
+use bytes::{Buf, BufMut, Bytes};
 use parking_lot::RwLock;
 use tracing::info;
 
 use crate::{
-    compactor::Compactor,
-    file::{
-        log_reader::Reader, log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext,
-        SequentialFileImpl,
-    },
+    compactor::{Compactor, SeekTask, Task},
+    file::{path_of_file, Ext, Reader, SequentialFileImpl, WritableFileImpl, Writer},
     mem_table::{MemTable, MemTableIterator},
-    sstable::table_builder::TableBuilder,
+    sstable::TableBuilder,
     utils::{
         codec::{decode_varintu32, encode_varintu32, varintu32_length},
         Entry, OP_TYPE_PUT,
     },
     version::{
-        version_edit::VersionEdit,
-        version_set::{Version, VersionSet},
-        FileMetaData,
+        FileMetaData, VersionEdit, {Version, VersionSet},
     },
     Options,
 };
@@ -39,6 +34,10 @@ struct MemInner {
     imms: VecDeque<Arc<MemTable>>,
     logs: VecDeque<u64>,
     wal: Writer,
+    #[allow(unused)]
+    log_buf: Vec<u8>,
+    #[allow(unused)]
+    miss_count: usize,
 }
 
 impl MemInner {
@@ -55,6 +54,8 @@ impl MemInner {
                 next_file_id,
                 Ext::WAL,
             ))),
+            log_buf: Vec::new(),
+            miss_count: 0,
         }
     }
 }
@@ -79,7 +80,7 @@ impl LsmInner {
         let snap = self.mem_inner.read();
         snap.imms.len()
     }
-    fn try_make_room(&self) -> Result<()> {
+    fn try_make_room(&self) -> Result<bool> {
         let mut mem_inner = self.mem_inner.write();
         // let mut snap = mem_inner.as_ref().clone();
         if mem_inner.mem.approximate_memory_usage() > self.opt.mem_size as u64 {
@@ -98,66 +99,72 @@ impl LsmInner {
             ));
 
             let _ = std::mem::replace(&mut mem_inner.wal, wal);
+            return Ok(true);
         }
-        Ok(())
+        Ok(mem_inner.imms.len() > 3)
     }
 
-    pub fn delete(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.try_make_room()?;
+    pub fn delete(&self, key: &[u8], value: &[u8]) -> Result<Option<Task>> {
+        let need_compact = self.try_make_room()?;
 
-        let inner = self.mem_inner.read();
-        // write wal first
         let seq = self.version.add_last_sequence(1);
+        // write wal first
         self.write_wal(key, value, seq).unwrap();
+        let inner = self.mem_inner.read();
 
         // let mem_inner = self.mem_inner.read();
         // write data
-        let e = Entry::new(key.to_vec(), value.to_vec(), seq);
+        let e = Entry::new(Bytes::from(key.to_vec()), Bytes::from(value.to_vec()), seq);
         inner.mem.delete(e);
 
-        Ok(())
+        let task = need_compact
+            .then_some(Task::Compact)
+            .or(self.version.need_compact().then_some(Task::Major));
+        Ok(task)
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.try_make_room()?;
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Task>> {
+        let need_compact = self.try_make_room()?;
 
         // write wal first
-        let inner = self.mem_inner.read();
         let seq = self.version.add_last_sequence(1);
         self.write_wal(key, value, seq).unwrap();
 
+        let inner = self.mem_inner.read();
+
         // let mem_inner = self.mem_inner.read();
         // write data
-        let e = Entry::new(key.to_vec(), value.to_vec(), seq);
+        let e = Entry::new(Bytes::from(key.to_vec()), Bytes::from(value.to_vec()), seq);
         inner.mem.put(e);
 
-        Ok(())
+        let task = need_compact
+            .then_some(Task::Compact)
+            .or(self.version.need_compact().then_some(Task::Major));
+        Ok(task)
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> Result<(Option<Vec<u8>>, Option<Task>)> {
         let inner = self.mem_inner.read();
 
         let seq = self.version.last_sequence();
         // search memtable first
         let result = inner.mem.get(key, seq);
         if result.is_some() {
-            return Ok(result.map(|val| val.to_vec()));
+            return Ok((result.map(|val| val.to_vec()), None));
         }
         // serach immutable memtable
         for m in inner.imms.iter().rev() {
             if let Some(result) = m.get(key, seq) {
-                return Ok(Some(result.to_vec()));
+                return Ok((Some(result.to_vec()), None));
             }
         }
         // search sst
         let current = self.version.current();
         current.refs();
-        if let Some(result) = current.get(self.opt.clone(), key, seq) {
-            current.derefs();
-            return Ok(Some(result.to_vec()));
-        }
+        let (value, task) = current.get(self.opt.clone(), key, seq);
+
         current.derefs();
-        Ok(None)
+        Ok((value, task))
     }
     fn write_wal(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
         let mut data = Vec::new();
@@ -167,8 +174,18 @@ impl LsmInner {
         encode_varintu32(&mut data, value.len() as u32);
         data.put(value);
         {
-            let inner = self.mem_inner.read_recursive();
-            inner.wal.add_recore(&data)
+            let mut inner = self.mem_inner.write();
+            // inner.log_buf.append(&mut data);
+            inner.miss_count += 1;
+            // if inner.miss_count >= self.opt.allow_miss_count
+            //     || inner.log_buf.len() >= self.opt.allow_miss_size
+            // {
+            //     inner.miss_count = 0;
+            // inner.wal.add_recore(&inner.log_buf)?;
+            inner.wal.add_recore(&data)?;
+            //     inner.log_buf.clear();
+            // }
+            Ok(())
         }
     }
     pub fn compact_mem_table(&self) {
@@ -184,10 +201,10 @@ impl LsmInner {
             base = self.version.current();
             imm = inner.imms[0].clone();
             log_number = inner.logs[0];
-            // inner.bitset.set(1, false);
         }
         base.refs();
-        self.write_level0_table(base, imm, log_number);
+        let iter = MemTableIterator::new(&imm);
+        self.write_level0_table(base, iter, log_number);
         {
             let mut inner = self.mem_inner.write();
             inner.logs.pop_front();
@@ -225,7 +242,12 @@ impl LsmInner {
                     compacted.push(format!("{:05}.sst", f.number));
                     Ok(())
                 })?;
-            info!("Major compact {:?} to level {}", compacted, c.target_level);
+            info!(
+                "Major compact {:?} to level {} --> {:?}",
+                compacted,
+                c.target_level,
+                format!("{:05}.sst", file_meta.number)
+            );
         } else {
             current.derefs();
         }
@@ -233,27 +255,61 @@ impl LsmInner {
         Ok(())
     }
 
-    // pub fn gc(&self) -> Result<()> {
-    //     let current = self.version.current();
-    //     current.refs();
-    //     let mut file_meta = FileMetaData::new(0);
-    //     if let Some(state) = self.version.do_gc(&mut file_meta)? {
-    //         let mut edit = VersionEdit::new();
-    //         edit.add_file(state.level as u32, file_meta.clone());
-    //         edit.delete_file(state.level as u32, state.rewrite_file);
-    //         let inner = self.mem_inner.read();
-    //         edit.log_number(inner.logs[0] - 1);
-    //         current.derefs();
-    //
-    //         self.version.log_and_apply(edit).unwrap();
-    //         // self.version.remove_ssts()?;
-    //     } else {
-    //         current.derefs();
-    //     }
-    //     Ok(())
-    // }
+    pub fn seek_compaction(&self, seek_task: &SeekTask) -> Result<()> {
+        let current = self.version.current();
+        current.refs();
+        let mut file_meta = FileMetaData::new(0);
+        if let Some(c) = self.version.do_seek_compaction(&mut file_meta, seek_task)? {
+            let mut edit = VersionEdit::new();
+            c.base
+                .iter()
+                .for_each(|f| edit.delete_file(c.base_level as u32, f.clone()));
+            c.target
+                .iter()
+                .for_each(|f| edit.delete_file(c.target_level as u32, f.clone()));
 
-    fn write_level0_table(&self, version: Arc<Version>, imm: Arc<MemTable>, log_number: u64) {
+            edit.add_file(c.target_level as u32, file_meta.clone());
+
+            let inner = self.mem_inner.read();
+            edit.log_number(inner.logs[0] - 1);
+            current.derefs();
+            self.version.log_and_apply(edit).unwrap();
+
+            // delete files
+            self.version.remove_ssts()?;
+            // let mut compacted = vec![];
+            let mut base = vec![];
+            let mut target = vec![];
+            for (b, t) in c.base.iter().zip(c.target.iter()) {
+                base.push(format!("{:05}.sst", b.number));
+                target.push(format!("{:05}.sst", t.number));
+            }
+            // c.base
+            //     .iter()
+            //     .chain(c.target.iter())
+            //     .try_for_each(|f| -> Result<()> {
+            //         compacted.push(format!("{:05}.sst", f.number));
+            //         Ok(())
+            //     })?;
+            // info!("Seek compact {:?} to level {}", compacted, c.target_level);
+            info!(
+                "Seek compact\n {:?},\n  {:?}\n to level {} {:?}",
+                base,
+                target,
+                c.target_level,
+                format!("{:05}.sst", file_meta.number),
+            );
+        } else {
+            current.derefs();
+        }
+
+        Ok(())
+    }
+
+    fn write_level0_table<T>(&self, version: Arc<Version>, iter: T, log_number: u64)
+    where
+        T: Iterator<Item = Entry>,
+    {
         {
             // let inner = self.mem_inner.read();
             let mut edit = VersionEdit::new();
@@ -264,7 +320,7 @@ impl LsmInner {
             TableBuilder::build_table(
                 path_of_file(&self.opt.work_dir, fid, Ext::SST).as_path(),
                 self.opt.clone(),
-                MemTableIterator::new(&imm),
+                iter,
                 &mut file_meta,
             )
             .unwrap();
@@ -300,8 +356,10 @@ impl LsmInner {
     }
 
     fn recover_mem(&self) -> Result<()> {
-        let mut wal_count = 0;
         let mut seq = 0_u64;
+        let mut next_file_id = self.version.new_file_number();
+        let mut remove_logs = vec![];
+        let mut data_count = 0;
         {
             let mut inner = self.mem_inner.write();
 
@@ -313,6 +371,9 @@ impl LsmInner {
                         let fid = name.parse::<u64>()?;
                         if ext == "wal" {
                             if fid > log_number {
+                                if fid > next_file_id {
+                                    next_file_id = fid;
+                                }
                                 let mut f = Reader::new(Box::new(SequentialFileImpl::new(
                                     path_of_file(&self.opt.work_dir, fid, Ext::WAL).as_path(),
                                 )));
@@ -333,9 +394,14 @@ impl LsmInner {
                                             let var_val_sz = varintu32_length(val_sz) as usize;
                                             let value = &value[var_val_sz..];
                                             inner.mem.set(
-                                                Entry::new(key.to_vec(), value.to_vec(), seq),
+                                                Entry::new(
+                                                    Bytes::from(key.to_vec()),
+                                                    Bytes::from(value.to_vec()),
+                                                    seq,
+                                                ),
                                                 OP_TYPE_PUT,
                                             );
+                                            data_count += 1;
                                         }
                                         Err(err) => match err.kind() {
                                             std::io::ErrorKind::UnexpectedEof => end = true,
@@ -343,11 +409,12 @@ impl LsmInner {
                                         },
                                     };
                                 }
-                                let imm =
-                                    std::mem::replace(&mut inner.mem, Arc::new(MemTable::new()));
-                                inner.imms.push_back(imm);
-                                inner.logs.push_back(fid);
-                                wal_count += 1;
+                                // let imm =
+                                //     std::mem::replace(&mut inner.mem, Arc::new(MemTable::new()));
+                                // inner.imms.push_back(imm);
+                                // inner.logs.push_back(fid);
+                                // wal_count += 1;
+                                remove_logs.push(fid);
                             } else {
                                 let path = path_of_file(&self.opt.work_dir, fid, Ext::WAL);
                                 std::fs::remove_file(path.as_path())?;
@@ -356,9 +423,21 @@ impl LsmInner {
                     }
                 }
             }
+            self.version.set_file_number(next_file_id + 5);
+            if data_count != 0 {
+                let imm = std::mem::replace(&mut inner.mem, Arc::new(MemTable::new()));
+                inner.imms.push_back(imm);
+                inner.logs.push_back(remove_logs.pop().unwrap());
+            }
         }
-        for _ in 0..wal_count {
+
+        if data_count != 0 {
             self.compact_mem_table();
+        }
+        // remove wal files
+        for fid in remove_logs {
+            let path = path_of_file(&self.opt.work_dir, fid, Ext::WAL);
+            std::fs::remove_file(path.as_path())?;
         }
 
         let mut inner = self.mem_inner.write();
@@ -380,20 +459,19 @@ pub struct Lsm {
     // opt: Options,
     // mem_inner: Arc<RwLock<Arc<MemInner>>>,
     inner: Arc<LsmInner>,
-    bg_tx: Option<SyncSender<()>>,
+    bg_tx: Option<SyncSender<Task>>,
 }
 
 impl Lsm {
     pub fn open(opt: Options) -> Self {
         let path = Path::new(&opt.work_dir);
         if !path.exists() {
-            std::fs::create_dir(path).expect("create work direction fail!");
+            std::fs::create_dir_all(path).expect("create work direction fail!");
         }
 
         let mut lsm = Self {
             inner: Arc::new(LsmInner::new(opt.clone())),
             bg_tx: None,
-            // opt,
         };
         lsm.inner.recover().unwrap();
         lsm.bg_tx = lsm.run_bg_task().into();
@@ -401,23 +479,43 @@ impl Lsm {
     }
 
     pub fn delete(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if let Some(tx) = self.bg_tx.as_ref() {
-            tx.send(())?;
-        }
-        self.inner.delete(key, value)
+        let task = self.inner.delete(key, value)?;
+        self.handle_task(task);
+        Ok(())
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if let Some(tx) = self.bg_tx.as_ref() {
-            tx.send(())?;
-        }
-        self.inner.put(key, value)
+        let task = self.inner.put(key, value)?;
+        self.handle_task(task);
+        Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key)
+        let (value, task) = self.inner.get(key)?;
+        self.handle_task(task);
+        Ok(value)
     }
-    fn run_bg_task(&self) -> SyncSender<()> {
+
+    fn handle_task(&self, task: Option<Task>) {
+        if let Some(tx) = self.bg_tx.as_ref() {
+            match task {
+                None => {}
+                Some(task) => match task {
+                    Task::Compact => {
+                        let _ = tx.try_send(Task::Compact);
+                    }
+                    Task::Seek(task) => {
+                        let _ = tx.try_send(Task::Seek(task));
+                    }
+                    Task::Major => {
+                        let _ = tx.try_send(Task::Major);
+                    }
+                },
+            }
+        }
+    }
+
+    fn run_bg_task(&self) -> SyncSender<Task> {
         let (tx, rx) = sync_channel(1000);
         let db = self.inner.clone();
         std::thread::Builder::new()

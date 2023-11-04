@@ -1,13 +1,15 @@
-pub mod log_reader;
-pub mod log_writer;
-pub mod readable;
-pub mod writeable;
+mod log_reader;
+mod log_writer;
+mod readable;
+mod writeable;
 
 use std::io::Error;
 use std::path::{Path, PathBuf};
 
-pub use self::readable::*;
-use self::writeable::WritableFileImpl;
+pub use log_reader::*;
+pub use log_writer::*;
+pub use readable::*;
+pub use writeable::*;
 
 // A file abstraction for reading sequentially through a file
 pub trait SequentialAccess {

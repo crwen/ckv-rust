@@ -16,7 +16,15 @@ type TableIterator<'a> = crossbeam_skiplist::map::Iter<'a, Key, Bytes>;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Key {
-    key: Vec<u8>,
+    key: Bytes,
+}
+
+impl From<Vec<u8>> for Key {
+    fn from(key: Vec<u8>) -> Self {
+        Self {
+            key: Bytes::from(key),
+        }
+    }
 }
 
 impl PartialOrd for Key {
@@ -53,7 +61,7 @@ impl Ord for Key {
 }
 
 impl Key {
-    pub fn new(key: Vec<u8>) -> Self {
+    pub fn new(key: Bytes) -> Self {
         Self { key }
     }
 
@@ -65,11 +73,15 @@ impl Key {
         &key[var_sz..var_sz + sz as usize]
     }
 
-    pub fn internal_key(&self) -> &[u8] {
-        let key = &self.key[..];
-        let sz = decode_varintu32(key).unwrap();
+    pub fn internal_key(&self) -> Bytes {
+        // let key = &self.key[..];
+        // let key = &self.key[..];
+        // let sz = decode_varintu32(key).unwrap();
+        let sz = decode_varintu32(&self.key).unwrap();
         let var_sz = varintu32_length(sz) as usize;
-        &key[var_sz..]
+        // &key[var_sz..]
+        self.key.slice(var_sz..)
+        // &self.key[var_sz..]
     }
 
     pub fn tag(key: &[u8]) -> &[u8] {
@@ -121,9 +133,9 @@ impl MemTable {
     }
 
     pub fn get(&self, key: &[u8], seq: u64) -> Option<Bytes> {
-        let entry = Entry::new(key.to_vec(), vec![], seq);
+        let entry = Entry::new(Bytes::from(key.to_vec()), Bytes::new(), seq);
         let internal_key = MemTable::build_internal_key(&entry, OP_TYPE_PUT);
-        let e = Entry::new(entry.key, vec![], 0);
+        let e = Entry::new(entry.key, Bytes::new(), 0);
         let right = MemTable::build_internal_key(&e, OP_TYPE_PUT);
         let key = self
             .table
@@ -181,10 +193,11 @@ impl MemTable {
 
         encode_varintu32(&mut internal_key, key_sz);
 
-        internal_key.put_slice(key);
+        // internal_key.put_slice(key);
+        internal_key.put(key);
         internal_key.put_u64((seq << 8) | typ as u64);
 
-        Key::new(internal_key)
+        Key::new(Bytes::from(internal_key))
     }
 
     // +-----------------+
@@ -197,7 +210,8 @@ impl MemTable {
 
         encode_varintu32(&mut value_wrap, value_sz);
 
-        value_wrap.put_slice(value);
+        // value_wrap.put_slice(value);
+        value_wrap.put(value);
 
         Bytes::from(value_wrap)
     }
@@ -212,8 +226,8 @@ impl Default for MemTable {
 pub struct MemTableIterator<'a> {
     mem: &'a MemTable,
     table_iter: TableIterator<'a>,
-    key: Vec<u8>,
-    value: Vec<u8>,
+    key: Bytes,
+    value: Bytes,
 }
 
 impl<'a> Iterator for MemTableIterator<'a> {
@@ -225,8 +239,9 @@ impl<'a> Iterator for MemTableIterator<'a> {
             Some(item) => {
                 let value = item.value();
                 let value_sz = decode_varintu32(value).unwrap();
-                self.key = item.key().internal_key().to_vec();
-                self.value = value[varintu32_length(value_sz) as usize..].to_vec();
+                self.key = item.key().internal_key();
+                // self.value = value[varintu32_length(value_sz) as usize..].to_vec();
+                self.value = value.slice(varintu32_length(value_sz) as usize..);
                 Some(Entry::new(
                     self.key.clone(),
                     self.value.clone(),
@@ -250,8 +265,8 @@ impl<'a> MemTableIterator<'a> {
         Self {
             mem,
             table_iter: mem.table.iter(),
-            key: Vec::new(),
-            value: Vec::new(),
+            key: Bytes::new(),
+            value: Bytes::new(),
         }
     }
 
@@ -272,9 +287,9 @@ mod mem_tests {
 
     #[test]
     fn key_cmp_test() {
-        let key1 = Key::new(vec![1, 1, 0, 0, 0, 0, 0, 0, 1, 0]);
-        let key2 = Key::new(vec![1, 2, 0, 0, 0, 0, 0, 0, 1, 0]);
-        let key3 = Key::new(vec![1, 1, 0, 0, 0, 0, 0, 0, 2, 0]);
+        let key1 = Key::from(vec![1, 1, 0, 0, 0, 0, 0, 0, 1, 0]);
+        let key2 = Key::from(vec![1, 2, 0, 0, 0, 0, 0, 0, 1, 0]);
+        let key3 = Key::from(vec![1, 1, 0, 0, 0, 0, 0, 0, 2, 0]);
         assert!(key1 < key2);
         assert!(key1 > key3);
         assert!(key2 > key3);
@@ -282,17 +297,21 @@ mod mem_tests {
 
     fn build_base_table() -> MemTable {
         let memtable = MemTable::new();
-        let e = Entry::new(vec![3], vec![30], 0);
+        let e = Entry::new(Bytes::from(vec![3]), Bytes::from(vec![30]), 0);
         memtable.put(e);
-        let e = Entry::new(vec![1], vec![11], 1);
+        let e = Entry::new(Bytes::from(vec![1]), Bytes::from(vec![11]), 1);
         memtable.put(e);
-        let e = Entry::new(vec![1], vec![12], 2);
+        let e = Entry::new(Bytes::from(vec![1]), Bytes::from(vec![12]), 2);
         memtable.put(e);
-        let e = Entry::new(vec![1], vec![13], 3);
+        let e = Entry::new(Bytes::from(vec![1]), Bytes::from(vec![13]), 3);
         memtable.put(e);
-        let e = Entry::new(vec![3], vec![34], 4);
+        let e = Entry::new(Bytes::from(vec![3]), Bytes::from(vec![34]), 4);
         memtable.put(e);
-        let e = Entry::new(vec![254, 233, 234], vec![254, 233, 234], 9);
+        let e = Entry::new(
+            Bytes::from(vec![254, 233, 234]),
+            Bytes::from(vec![254, 233, 234]),
+            9,
+        );
         memtable.put(e);
 
         memtable
@@ -301,36 +320,36 @@ mod mem_tests {
     #[test]
     fn search_test() {
         let memtable = build_base_table();
-        let e = Entry::new(vec![1], vec![], 0);
+        let e = Entry::new(Bytes::from(vec![1]), Bytes::new(), 0);
         // let e3 = Entry::new(vec![3], vec![], 0);
         // let e4 = Entry::new(vec![3], vec![], 4);
         // let e4 = Entry::new(vec![2], vec![], 5);
         let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, None);
-        let e = Entry::new(vec![1], vec![], 2);
+        let e = Entry::new(Bytes::from(vec![1]), Bytes::new(), 2);
         let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, Some(Bytes::from(vec![12])));
-        let e = Entry::new(vec![1], vec![], 5);
+        let e = Entry::new(Bytes::from(vec![1]), Bytes::from(vec![]), 5);
         let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, Some(Bytes::from(vec![13])));
 
-        let e = Entry::new(vec![2], vec![], 5);
+        let e = Entry::new(Bytes::from(vec![2]), Bytes::new(), 5);
         let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, None);
 
-        let e = Entry::new(vec![3], vec![], 5);
+        let e = Entry::new(Bytes::from(vec![3]), Bytes::from(vec![]), 5);
         let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, Some(Bytes::from(vec![34])));
 
-        let e = Entry::new(vec![22], vec![], 5);
+        let e = Entry::new(Bytes::from(vec![22]), Bytes::from(vec![]), 5);
         let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, None);
 
-        let e = Entry::new(vec![254, 233, 234], vec![], 8);
+        let e = Entry::new(Bytes::from(vec![254, 233, 234]), Bytes::from(vec![]), 8);
         let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, None);
 
-        let e = Entry::new(vec![254, 233, 234], vec![], 9);
+        let e = Entry::new(Bytes::from(vec![254, 233, 234]), Bytes::from(vec![]), 9);
         let res = memtable.get(&e.key, e.seq);
         assert_eq!(res, Some(Bytes::from(vec![254, 233, 234])));
     }
@@ -340,11 +359,15 @@ mod mem_tests {
         let memtable = MemTable::new();
         assert_eq!(memtable.refs.load(Ordering::SeqCst), 1);
         for i in 0..100 {
-            let e = Entry::new(vec![i], vec![i], i as u64);
+            let e = Entry::new(Bytes::from(vec![i]), Bytes::from(vec![i]), i as u64);
             memtable.put(e);
         }
         for i in 0..100 {
-            let e = Entry::new(vec![i], vec![i, i], (i + 100) as u64);
+            let e = Entry::new(
+                Bytes::from(vec![i]),
+                Bytes::from(vec![i, i]),
+                (i + 100) as u64,
+            );
             memtable.put(e);
         }
         let iter = MemTableIterator::new(&memtable);

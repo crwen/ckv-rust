@@ -50,6 +50,8 @@ impl Iterator for MergeIterator {
 mod merge_test {
     use std::sync::Arc;
 
+    use bytes::Bytes;
+
     use crate::{
         file::{path_of_file, Ext, RandomAccessFileImpl},
         mem_table::{MemTable, MemTableIterator},
@@ -78,8 +80,8 @@ mod merge_test {
             let mem = MemTable::new();
             for j in 0..50 {
                 let e = Entry::new(
-                    (j as u32).to_be_bytes().to_vec(),
-                    (j as u32).to_be_bytes().to_vec(),
+                    Bytes::from((j as u32).to_be_bytes().to_vec()),
+                    Bytes::from((j as u32).to_be_bytes().to_vec()),
                     j + i * 50,
                 );
                 mem.put(e);

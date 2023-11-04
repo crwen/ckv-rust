@@ -1,9 +1,9 @@
 use std::{io::Error, path::Path};
 
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 
 use crate::{
-    file::{log_writer::Writer, path_of_file, writeable::WritableFileImpl, Ext, Writable},
+    file::{path_of_file, Ext, Writable, WritableFileImpl, Writer},
     utils::{bloom::BloomFilter, Entry, FilterPolicy},
     version::{FileMetaData, InternalKey},
     Options,
@@ -47,8 +47,8 @@ impl TableBuilder {
             fid,
             last_key: Vec::new(),
             pending_index_entry: false,
-            largest: InternalKey::new(vec![]),
-            smallest: InternalKey::new(vec![]),
+            largest: InternalKey::from(vec![]),
+            smallest: InternalKey::from(vec![]),
             filters_keys: Vec::new(),
             filters: Vec::new(),
             file_opt,
@@ -107,9 +107,9 @@ impl TableBuilder {
     /// TODO: prefix compaction
     pub fn add(&mut self, key: &[u8], value: &[u8]) {
         if self.smallest.is_empty() {
-            self.smallest = InternalKey::new(key.to_vec());
+            self.smallest = InternalKey::new(Bytes::from(key.to_vec()));
         }
-        self.largest = InternalKey::new(key.to_vec());
+        self.largest = InternalKey::new(Bytes::from(key.to_vec()));
 
         if self.pending_index_entry {
             self.index_block
@@ -117,7 +117,7 @@ impl TableBuilder {
             self.pending_index_entry = false;
         }
 
-        let internal_key = InternalKey::new(key.to_vec());
+        let internal_key = InternalKey::new(Bytes::from(key.to_vec()));
         self.filters_keys.push(internal_key.user_key().to_vec());
 
         self.last_key = key.to_vec();
@@ -204,7 +204,7 @@ impl TableBuilder {
 mod builder_test {
     use std::io::Read;
 
-    use bytes::Buf;
+    use bytes::{Buf, Bytes};
 
     use crate::{
         file::{path_of_file, Ext},
@@ -222,8 +222,8 @@ mod builder_test {
         let mem = MemTable::new();
         for i in 0..1000 {
             let e = Entry::new(
-                (i as u32).to_be_bytes().to_vec(),
-                (i as u32).to_be_bytes().to_vec(),
+                Bytes::from((i as u32).to_be_bytes().to_vec()),
+                Bytes::from((i as u32).to_be_bytes().to_vec()),
                 i,
             );
             mem.put(e);

@@ -1,6 +1,6 @@
 use std::io::Error;
 
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 use parking_lot::Mutex;
 
 use crate::utils::codec::calculate_checksum;
@@ -41,6 +41,23 @@ impl Writer {
         // self.file.append(data)?;
 
         inner.offset += data.len() as u64 + 12;
+        Ok(())
+    }
+
+    pub fn add_recore_batch(&self, data: &Vec<Bytes>) -> Result<(), anyhow::Error> {
+        let mut buf = Vec::new();
+        for b in data {
+            let checksum = calculate_checksum(&b[..]);
+            buf.put_u64(checksum);
+            // let mut buf = checksum.to_le_bytes().to_vec();
+            buf.put_u32(b.len() as u32);
+            buf.put(b.clone());
+        }
+
+        let mut inner = self.inner.lock();
+        inner.file.append(&buf)?;
+
+        inner.offset += buf.len() as u64;
         Ok(())
     }
 

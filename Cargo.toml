@@ -8,12 +8,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1"
-crossbeam-skiplist = "0.1"
 bytes = "1"
-thiserror = "1"
 crc32fast = "1"
-bitvec = "1"
+crossbeam-skiplist = "0.1"
 parking_lot = "0.12"
+thiserror = "1"
 tracing = "0.1"
 
 [dev-dependencies]

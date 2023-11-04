@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 pub mod bloom;
 pub mod codec;
 pub mod convert;
@@ -7,22 +9,22 @@ pub const OP_TYPE_PUT: u8 = 1;
 
 #[derive(Clone, Debug)]
 pub struct Entry {
-    pub key: Vec<u8>,
-    pub value: Vec<u8>,
+    pub key: Bytes,
+    pub value: Bytes,
     pub seq: u64,
 }
 
 impl Entry {
-    pub fn new(key: Vec<u8>, value: Vec<u8>, seq: u64) -> Self {
+    pub fn new(key: Bytes, value: Bytes, seq: u64) -> Self {
         Self { key, value, seq }
     }
 
-    pub fn key(&self) -> &Vec<u8> {
-        &self.key
+    pub fn key(&self) -> Bytes {
+        self.key.clone()
     }
 
-    pub fn value(&self) -> &Vec<u8> {
-        &self.value
+    pub fn value(&self) -> Bytes {
+        self.value.clone()
     }
 
     pub fn seq(&self) -> u64 {

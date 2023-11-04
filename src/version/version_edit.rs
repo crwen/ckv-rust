@@ -75,6 +75,7 @@ impl VersionEdit {
             last_seq_number: 0,
         }
     }
+
     pub fn decode(data: &[u8]) -> Self {
         let log_number = (&data[..8]).get_u64();
         let next_file_number = (&data[8..16]).get_u64();

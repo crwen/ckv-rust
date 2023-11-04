@@ -1,8 +1,13 @@
 mod block;
 mod block_builder;
-pub mod merge;
-pub mod table;
-pub mod table_builder;
+mod merge;
+mod table;
+mod table_builder;
+
+pub use block::Block;
+pub use merge::*;
+pub use table::*;
+pub use table_builder::*;
 
 pub type Result<T> = anyhow::Result<T, TableError>;
 

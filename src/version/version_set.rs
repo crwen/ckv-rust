@@ -14,20 +14,15 @@ use bytes::{Buf, BufMut};
 use parking_lot::RwLock;
 
 use crate::{
-    cache::table_cache::TableCache,
+    cache::Cache,
     // cache::lru::LRUCache,
-    compactor::{CompactionState, GCState},
+    compactor::{CompactionState, GCState, SeekTask, Task},
     file::{
-        log_reader::{RandomReader, Reader},
-        log_writer::Writer,
-        path_of_file,
-        writeable::WritableFileImpl,
-        Ext, RandomAccessFileImpl, SequentialFileImpl, Writable,
+        path_of_file, Ext, RandomAccessFileImpl, SequentialFileImpl, Writable, WritableFileImpl,
+        Writer, {RandomReader, Reader},
     },
     sstable::{
-        merge::MergeIterator,
-        table::{Table, TableIterator},
-        table_builder::TableBuilder,
+        Block, MergeIterator, TableBuilder, {Table, TableIterator},
     },
     utils::{Entry, OP_TYPE_PUT},
     Options,
@@ -40,6 +35,7 @@ type Result<T> = anyhow::Result<T, anyhow::Error>;
 
 const L0_COMPACTION_TRIGGER: u32 = 4;
 const L1_COMPACTION_TRIGGER: f64 = 1048576.0;
+const MAX_MEM_COMPACT_LEVEL: u32 = 0x2;
 // const L1_COMPACTION_TRIGGER: f64 = 100.0;
 
 pub struct Version {
@@ -47,11 +43,13 @@ pub struct Version {
     refs: AtomicU32,
     smallest_sequence: u64,
     smallest_log_number: u64,
-    table_cache: Arc<TableCache>,
+    table_cache: Arc<Cache<u64, Table>>,
+    #[allow(unused)]
+    index_cache: Arc<Cache<u64, Block>>,
 }
 
 impl Version {
-    pub fn new(table_cache: Arc<TableCache>) -> Self {
+    pub fn new(table_cache: Arc<Cache<u64, Table>>, block_cache: Arc<Cache<u64, Block>>) -> Self {
         let mut files: Vec<Vec<FileMetaData>> = Vec::new();
         files.resize_with(7, std::vec::Vec::new);
         Self {
@@ -60,10 +58,16 @@ impl Version {
             smallest_sequence: 0,
             smallest_log_number: 0,
             table_cache,
+            index_cache: block_cache,
         }
     }
 
-    pub fn build(table_cache: Arc<TableCache>, version: Arc<Version>, edit: &VersionEdit) -> Self {
+    pub fn build(
+        table_cache: Arc<Cache<u64, Table>>,
+        block_cache: Arc<Cache<u64, Block>>,
+        version: Arc<Version>,
+        edit: &VersionEdit,
+    ) -> Self {
         let mut files = version.files.clone();
 
         for f in edit.add_files.iter() {
@@ -89,6 +93,7 @@ impl Version {
             smallest_sequence: edit.last_seq_number,
             smallest_log_number: edit.log_number,
             table_cache,
+            index_cache: block_cache,
         }
     }
 
@@ -134,10 +139,11 @@ impl Version {
         internal_key
     }
 
-    pub fn get(&self, opt: Options, user_key: &[u8], seq: u64) -> Option<Vec<u8>> {
+    pub fn get(&self, opt: Options, user_key: &[u8], seq: u64) -> (Option<Vec<u8>>, Option<Task>) {
         // search L0 first
         let mut tmp = Vec::new();
         let internal_key = Version::build_internal_key(user_key, seq);
+        let mut task = (self.files[0].len() > 5).then_some(Task::Major);
         for (i, files) in self.files.iter().enumerate() {
             if i == 0 {
                 files
@@ -155,14 +161,25 @@ impl Version {
                         // let entry = self.search_sst(&path, &internal_key.clone());
                         let entry = self.search_sst(&opt, f.number, &internal_key.clone());
                         if entry.is_none() {
+                            let seek = f.increase_seek();
+                            if seek >= 100 && task.is_none() {
+                                f.allow_seek_reset();
+                                task = Some(Task::Seek(SeekTask {
+                                    level: 0,
+                                    fid: f.number,
+                                }))
+                            }
                             continue;
                         }
-                        return entry.map(|e| {
-                            let value = e.value();
-                            // let value_sz = decode_varintu32(value).unwrap();
-                            // Bytes::from(value[varintu32_length(value_sz) as usize..].to_vec())
-                            value.to_vec()
-                        });
+                        return (
+                            entry.map(|e| {
+                                let value = e.value();
+                                // let value_sz = decode_varintu32(value).unwrap();
+                                // Bytes::from(value[varintu32_length(value_sz) as usize..].to_vec())
+                                value.to_vec()
+                            }),
+                            task,
+                        );
                     }
                 }
             } else {
@@ -171,16 +188,24 @@ impl Version {
                     f.smallest.user_key() <= user_key && f.largest.user_key() >= user_key
                 });
                 if let Some(f) = f {
-                    // let path = path_of_file(&opt.work_dir, f.number, Ext::SST);
-                    // let entry = self.search_sst(path.as_path(), &internal_key.clone());
                     let entry = self.search_sst(&opt, f.number, &internal_key.clone());
                     if let Some(e) = entry {
-                        return Some(e.value);
+                        // return (Some(e.value), task);
+                        return (Some(e.value.to_vec()), task);
+                    } else {
+                        let seek = f.increase_seek();
+                        if seek >= 100 && task.is_none() {
+                            f.allow_seek_reset();
+                            task = Some(Task::Seek(SeekTask {
+                                level: i as u32,
+                                fid: f.number,
+                            }))
+                        }
                     }
                 }
             }
         }
-        None
+        (None, task)
     }
 
     fn search_sst(&self, opt: &Options, fid: u64, internal_key: &[u8]) -> Option<Entry> {
@@ -190,15 +215,13 @@ impl Version {
                 let path = path_of_file(&opt.work_dir, fid, Ext::SST);
                 let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path()))).unwrap();
                 let res = t.internal_get(opt, internal_key);
-                let _e = self.table_cache.insert(fid, Arc::new(t));
+                let _e = self.table_cache.insert(fid, t, 1);
                 res
             }
         };
+        let _ = self.table_cache.unpin(&fid);
 
         res
-        // let path = path_of_file(&opt.work_dir, fid, Ext::SST);
-        // let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path()))).unwrap();
-        // t.internal_get(internal_key)
     }
 
     pub fn pick_level_for_mem_table_output(&self, smallest: &[u8], largest: &[u8]) -> u32 {
@@ -206,7 +229,7 @@ impl Version {
         if !self.overlap_in_level(level, smallest, largest) {
             // push t onext level if there is no overlap in next level.
             // and the #bytes overlapping in the level after that are limited
-            while level < 2 {
+            while level < MAX_MEM_COMPACT_LEVEL {
                 if self.overlap_in_level(level + 1, smallest, largest) {
                     break;
                 }
@@ -233,10 +256,11 @@ impl Version {
                 best_score = score;
             }
         }
-        if best_score > 0.8 {
-            return Some(best_level);
-        }
-        None
+        best_score.ge(&1.0).then_some(best_level)
+        // if best_score > 0.8 {
+        //     return Some(best_level);
+        // }
+        // None
     }
 
     fn total_size(&self, level: usize) -> f64 {
@@ -294,7 +318,8 @@ pub struct VersionSet {
     next_file_number: AtomicU64,
     #[allow(dead_code)]
     log_file: Writer,
-    table_cache: Arc<TableCache>,
+    table_cache: Arc<Cache<u64, Table>>,
+    index_cache: Arc<Cache<u64, Block>>,
     opt: Options,
 }
 
@@ -311,7 +336,8 @@ struct VersionSetInner {
 
 impl VersionSet {
     pub fn new(opt: Options) -> Self {
-        let table_cache = Arc::new(TableCache::with_capacity(1 << 22));
+        let table_cache = Arc::new(Cache::with_capacity(1000));
+        let index_cache = Arc::new(Cache::with_capacity(opt.cache_size));
         let versions = LinkedList::new();
         // versions.push_back(Arc::new(Version::new(table_cache.clone())));
         Self {
@@ -324,6 +350,7 @@ impl VersionSet {
                 Ext::MANIFEST,
             ))),
             table_cache,
+            index_cache,
             opt,
         }
     }
@@ -347,12 +374,25 @@ impl VersionSet {
         self.next_file_number.fetch_add(1, Ordering::SeqCst)
     }
 
+    pub fn set_file_number(&self, next_file_number: u64) {
+        self.next_file_number
+            .store(next_file_number, Ordering::SeqCst)
+    }
+
     pub fn last_sequence(&self) -> u64 {
         self.last_sequence.load(Ordering::SeqCst)
     }
 
     pub fn add_last_sequence(&self, n: u64) -> u64 {
         self.last_sequence.fetch_add(n, Ordering::SeqCst)
+    }
+
+    pub fn need_compact(&self) -> bool {
+        self.current().pick_compact_level().is_some()
+        // if self.current().files[0].len() > 8 {
+        //     return true;
+        // }
+        // false
     }
 
     pub fn log_and_apply(&self, mut edit: VersionEdit) -> Result<()> {
@@ -368,7 +408,12 @@ impl VersionSet {
 
         // modify memory metadata
         let base = versions.back().unwrap().clone();
-        let current = Version::build(Arc::clone(&self.table_cache), base.clone(), &edit);
+        let current = Version::build(
+            Arc::clone(&self.table_cache),
+            Arc::clone(&self.index_cache),
+            base.clone(),
+            &edit,
+        );
         versions.push_back(Arc::new(current));
         base.derefs();
 
@@ -379,6 +424,13 @@ impl VersionSet {
             } else {
                 break;
             }
+        }
+        for table_meta in edit.add_files.iter() {
+            let fid = table_meta.file_meta.number;
+            let path = path_of_file(&self.opt.work_dir, fid, Ext::SST);
+            let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path())))?;
+            self.table_cache.insert(fid, t, 1)?;
+            self.table_cache.unpin(&fid)?;
         }
         Ok(())
     }
@@ -427,82 +479,168 @@ impl VersionSet {
         })
     }
 
+    fn pick_seek_compaction(&self, seek_task: &SeekTask) -> Option<CompactionState> {
+        let level = seek_task.level as usize;
+        let current = self.current();
+        let mut base = vec![];
+        let target;
+        let mut files = current.files[level].clone();
+
+        if level == 0 {
+            files.sort_by(|f1, f2| match f1.smallest.cmp(&f2.smallest) {
+                std::cmp::Ordering::Equal => f1.largest.cmp(&f2.largest),
+                other => other,
+            });
+            let seek_f = files.iter().find(|f| f.number == seek_task.fid);
+            if let Some(seek_f) = seek_f {
+                let (mut smallest, mut largest) =
+                    (seek_f.smallest.user_key(), seek_f.largest.user_key());
+                for f in files.iter() {
+                    if !(f.smallest.user_key() > largest || f.largest.user_key() < smallest) {
+                        if f.smallest.user_key() < smallest {
+                            smallest = f.smallest.user_key();
+                        }
+                        if f.largest.user_key() < largest {
+                            largest = f.largest.user_key();
+                        }
+                        base.push(f.clone());
+                    }
+                }
+                target = current.overlaping_inputs((level + 1) as u32, smallest, largest);
+            } else {
+                return None;
+            }
+        } else {
+            let seek_f = current.files[level]
+                .iter()
+                .find(|f| f.number == seek_task.fid);
+            if let Some(seek_f) = seek_f {
+                base.push(seek_f.clone());
+                target = current.overlaping_inputs(
+                    (level + 1) as u32,
+                    seek_f.smallest.user_key(),
+                    seek_f.largest.user_key(),
+                );
+            } else {
+                return None;
+            }
+        }
+
+        Some(CompactionState {
+            base_level: level,
+            target_level: level + 1,
+            target,
+            base,
+        })
+    }
+
     pub fn do_compaction(&self, meta: &mut FileMetaData) -> Result<Option<CompactionState>> {
+        if let Some(c) = self.pick_compaction() {
+            return self.do_compaction_inner(meta, c);
+        }
+        Ok(None)
+    }
+
+    pub fn do_seek_compaction(
+        &self,
+        meta: &mut FileMetaData,
+        seek_task: &SeekTask,
+    ) -> Result<Option<CompactionState>> {
+        if let Some(c) = self.pick_seek_compaction(seek_task) {
+            if c.base.len() + c.target.len() < 2 {
+                return Ok(None);
+            }
+            return self.do_compaction_inner(meta, c);
+        }
+        Ok(None)
+    }
+
+    pub fn do_compaction_inner(
+        &self,
+        meta: &mut FileMetaData,
+        c: CompactionState,
+    ) -> Result<Option<CompactionState>> {
         let skip =
             |internal_key: InternalKey| -> bool { self.smallest_sequence() > internal_key.seq() };
 
-        if let Some(c) = self.pick_compaction() {
-            let mut iters = vec![];
-            let mut files_iter = c.base.iter().chain(c.target.iter());
-            files_iter.try_for_each(|f| -> Result<()> {
-                let path = path_of_file(&self.opt.work_dir, f.number, Ext::SST);
-                let t = Table::new(Box::new(RandomAccessFileImpl::open(path.as_path())))?;
-                let iter = TableIterator::new(Arc::new(t))?;
-                iters.push(iter);
-                Ok(())
-            })?;
-
-            meta.number = self.new_file_number();
-            let merge_iter = MergeIterator::new(iters);
-            let path = path_of_file(&self.opt.work_dir, meta.number, Ext::SST);
-            let mut vlog_cache = HashMap::<u64, RandomReader>::new();
-            let mut vlog = None;
-
-            {
-                let mut tb = TableBuilder::new(
-                    self.opt.clone(),
-                    Box::new(WritableFileImpl::new(path.as_path())),
-                    meta.number,
-                );
-                let mut last_key = InternalKey::new(vec![]);
-                for e in merge_iter {
-                    let key = InternalKey::new(e.key.clone());
-                    if !(key == last_key && skip(InternalKey::new(e.key.clone()))) {
-                        last_key = key;
-                        let mut value = e.value.clone();
-                        // if c.target_level >= 0 && !value.is_empty() && value[0] == 1 {
-                        if !value.is_empty() && value[0] == 1 {
-                            // do vlog merge on last two level
-
-                            // read value in vlog
-                            let fid = (&value[1..9]).get_u64();
-                            let offset = (&value[9..17]).get_u64();
-                            let log = vlog_cache.entry(fid).or_insert_with(|| {
-                                let path =
-                                    path_of_file(&self.opt.work_dir, fid, crate::file::Ext::VLOG);
-                                RandomReader::new(Box::new(RandomAccessFileImpl::open(
-                                    path.as_path(),
-                                )))
-                            });
-                            let ivalue = log.read_record(offset).unwrap();
-
-                            let vwriter = vlog.get_or_insert(Writer::new(WritableFileImpl::new(
-                                &path_of_file(&self.opt.work_dir, meta.number, Ext::VLOG),
-                            )));
-                            // construct value in sst
-                            let off = vwriter.offset();
-                            value.clear();
-                            value.put_u8(1);
-                            value.put_u64(meta.number);
-                            value.put_u64(off);
-
-                            vwriter.add_recore(&ivalue)?;
-                        }
-                        tb.add(&e.key, &value);
-                    }
+        let mut iters = vec![];
+        let mut files_iter = c.base.iter().chain(c.target.iter());
+        let mut total_sz = 0;
+        files_iter.try_for_each(|f| -> Result<()> {
+            let t = match self.table_cache.get(&f.number) {
+                Some(t) => t,
+                None => {
+                    let path = path_of_file(&self.opt.work_dir, f.number, Ext::SST);
+                    Arc::new(Table::new(Box::new(RandomAccessFileImpl::open(
+                        path.as_path(),
+                    )))?)
                 }
-                tb.finish_builder(meta)?;
-                if vlog.is_none() {
-                    c.base.iter().chain(c.target.iter()).for_each(|f| {
-                        meta.vlogs.append(&mut f.vlogs.clone());
-                    });
-                } else {
-                    meta.vlogs.push(meta.number);
+            };
+            total_sz += t.size();
+            let iter = TableIterator::new(t)?;
+            iters.push(iter);
+            self.table_cache.unpin(&f.number)?;
+            Ok(())
+        })?;
+
+        meta.number = self.new_file_number();
+        let merge_iter = MergeIterator::new(iters);
+        let path = path_of_file(&self.opt.work_dir, meta.number, Ext::SST);
+        let mut vlog_cache = HashMap::<u64, RandomReader>::new();
+        let mut vlog = None;
+
+        {
+            let mut tb = TableBuilder::new(
+                self.opt.clone(),
+                Box::new(WritableFileImpl::new(path.as_path())),
+                meta.number,
+            );
+            let mut last_key = InternalKey::from(vec![]);
+            for e in merge_iter {
+                let key = InternalKey::new(e.key.clone());
+                if !(key == last_key && skip(InternalKey::new(e.key.clone()))) {
+                    last_key = key;
+                    // let mut value = e.value.clone();
+                    let mut value = e.value.to_vec();
+                    // if c.target_level >= 0 && !value.is_empty() && value[0] == 1 {
+                    if !value.is_empty() && value[0] == 1 {
+                        // do vlog merge on last two level
+
+                        // read value in vlog
+                        let fid = (&value[1..9]).get_u64();
+                        let offset = (&value[9..17]).get_u64();
+                        let log = vlog_cache.entry(fid).or_insert_with(|| {
+                            let path =
+                                path_of_file(&self.opt.work_dir, fid, crate::file::Ext::VLOG);
+                            RandomReader::new(Box::new(RandomAccessFileImpl::open(path.as_path())))
+                        });
+                        let ivalue = log.read_record(offset).unwrap();
+
+                        let vwriter = vlog.get_or_insert(Writer::new(WritableFileImpl::new(
+                            &path_of_file(&self.opt.work_dir, meta.number, Ext::VLOG),
+                        )));
+                        // construct value in sst
+                        let off = vwriter.offset();
+                        value.clear();
+                        value.put_u8(1);
+                        value.put_u64(meta.number);
+                        value.put_u64(off);
+
+                        vwriter.add_recore(&ivalue)?;
+                    }
+                    tb.add(&e.key, &value);
                 }
             }
-            return Ok(Some(c));
+            tb.finish_builder(meta)?;
+            if vlog.is_none() {
+                c.base.iter().chain(c.target.iter()).for_each(|f| {
+                    meta.vlogs.append(&mut f.vlogs.clone());
+                });
+            } else {
+                meta.vlogs.push(meta.number);
+            }
         }
-        Ok(None)
+        Ok(Some(c))
     }
 
     pub fn remove_ssts(&self) -> Result<()> {
@@ -538,6 +676,7 @@ impl VersionSet {
         deletes.iter().try_for_each(|fid| -> Result<()> {
             let path = path_of_file(&self.opt.work_dir, *fid, Ext::SST);
             std::fs::remove_file(path.as_path())?;
+            self.table_cache.evict(*fid, 1)?;
             Ok(())
         })?;
         deletes_vlog.iter().try_for_each(|fid| -> Result<()> {
@@ -594,8 +733,13 @@ impl VersionSet {
         edit.last_seq_number(last_seq_number);
         edit.next_file_number(next_file_number);
 
-        let base = Version::new(Arc::clone(&self.table_cache));
-        let ver = Version::build(Arc::clone(&self.table_cache), Arc::new(base), &edit);
+        let base = Version::new(Arc::clone(&self.table_cache), Arc::clone(&self.index_cache));
+        let ver = Version::build(
+            Arc::clone(&self.table_cache),
+            Arc::clone(&self.index_cache),
+            Arc::new(base),
+            &edit,
+        );
 
         let mut versions = self.versions.write();
         versions.push_back(Arc::new(ver));

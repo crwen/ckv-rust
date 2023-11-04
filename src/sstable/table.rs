@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 
 use crate::{
-    file::{log_reader::RandomReader, path_of_file, RandomAccess, RandomAccessFileImpl},
+    file::{path_of_file, RandomAccess, RandomAccessFileImpl, RandomReader},
     utils::{bloom::BloomFilter, Entry, FilterPolicy},
     version::InternalKey,
     Options,
@@ -49,6 +49,9 @@ pub struct Table {
     filter_data: Vec<u8>,
 }
 
+unsafe impl Send for Table {}
+unsafe impl Sync for Table {}
+
 impl Table {
     pub fn new(file: Box<dyn RandomAccess>) -> anyhow::Result<Self, anyhow::Error> {
         // read footer
@@ -74,8 +77,8 @@ impl Table {
             // file_opt,
             file,
             index_block,
-            smallest: InternalKey::new(vec![]),
-            largest: InternalKey::new(vec![]),
+            smallest: InternalKey::new(Bytes::new()),
+            largest: InternalKey::new(Bytes::new()),
             file_sz,
             bloom: BloomFilter::new(BloomFilter::bits_per_key(1999, 0.1)),
             filter_data,
@@ -87,7 +90,7 @@ impl Table {
     }
 
     pub fn internal_get(&self, opt: &Options, internal_key: &[u8]) -> Option<Entry> {
-        let target = InternalKey::new(internal_key.to_vec());
+        let target = InternalKey::new(Bytes::from(internal_key.to_vec()));
         if !self.bloom.may_contain(&self.filter_data, target.user_key()) {
             return None;
         }
@@ -105,18 +108,18 @@ impl Table {
 
         if let Some(mut e) = data_iter.seek(internal_key) {
             let found = InternalKey::new(e.clone().key);
-            let target = InternalKey::new(internal_key.to_vec());
+            let target = InternalKey::new(Bytes::from(internal_key.to_vec()));
             if found.user_key() == target.user_key() {
                 let v = e.value.clone();
                 if !v.is_empty() && v[0] == 0 {
-                    e.value = v[1..].to_vec();
+                    e.value = Bytes::from(v[1..].to_vec());
                 } else if !v.is_empty() {
                     let fid = (&e.value[1..9]).get_u64();
                     let offset = (&e.value[9..17]).get_u64();
                     let path = path_of_file(&opt.work_dir, fid, crate::file::Ext::VLOG);
                     let mut vlog =
                         RandomReader::new(Box::new(RandomAccessFileImpl::open(path.as_path())));
-                    e.value = vlog.read_record(offset).unwrap();
+                    e.value = Bytes::from(vlog.read_record(offset).unwrap());
                 }
 
                 Some(e)
@@ -191,7 +194,8 @@ impl Iterator for TableIterator {
             self.idx_block += 1;
             if let Some(e) = self.index_iter.next() {
                 // let e = self.index_iter.next()?;
-                let handler = BlockHandler::decode(&e.value).expect("Decode block fail!");
+                // let handler = BlockHandler::decode(&e.value).expect("Decode block fail!");
+                let handler = BlockHandler::decode(e.value).expect("Decode block fail!");
 
                 let data_block = self.table.read_block(handler);
                 self.block_iter = data_block.into_iter();
@@ -209,8 +213,10 @@ mod table_test {
 
     use std::sync::Arc;
 
+    use bytes::Bytes;
+
     use crate::{
-        file::{path_of_file, readable::RandomAccessFileImpl, Ext},
+        file::{path_of_file, Ext, RandomAccessFileImpl},
         mem_table::{MemTable, MemTableIterator},
         sstable::{table::Table, table_builder::TableBuilder},
         utils::Entry,
@@ -225,8 +231,8 @@ mod table_test {
         let mem = MemTable::new();
         for i in 0..1000 {
             let e = Entry::new(
-                (i as u32).to_be_bytes().to_vec(),
-                (i as u32).to_be_bytes().to_vec(),
+                Bytes::from((i as u32).to_be_bytes().to_vec()),
+                Bytes::from((i as u32).to_be_bytes().to_vec()),
                 i,
             );
             mem.put(e);
