@@ -604,12 +604,14 @@ impl VersionSet {
                     // let mut value = e.value.clone();
                     let mut value = e.value.to_vec();
                     if c.base_level >= 1 && !value.is_empty() && value[0] == 1 {
-                        // if !value.is_empty() && value[0] == 1 {
                         // do vlog merge on
 
                         // read value in vlog
+                        assert!(value.len() >= 17); // tag(1) + fid(8) + offset(8)
+
                         let fid = (&value[1..9]).get_u64();
                         let offset = (&value[9..17]).get_u64();
+
                         let log = vlog_cache.entry(fid).or_insert_with(|| {
                             let path =
                                 path_of_file(&self.opt.work_dir, fid, crate::file::Ext::VLOG);
@@ -617,9 +619,13 @@ impl VersionSet {
                         });
                         let ivalue = log.read_record(offset).unwrap();
 
-                        let vwriter = vlog.get_or_insert(Writer::new(WritableFileImpl::new(
-                            &path_of_file(&self.opt.work_dir, meta.number, Ext::VLOG),
-                        )));
+                        let vwriter = vlog.get_or_insert_with(|| {
+                            Writer::new(WritableFileImpl::new(&path_of_file(
+                                &self.opt.work_dir,
+                                meta.number,
+                                Ext::VLOG,
+                            )))
+                        });
                         // construct value in sst
                         let off = vwriter.offset();
                         value.clear();
