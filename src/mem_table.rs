@@ -146,6 +146,9 @@ impl MemTable {
             .next();
         key.map(|e| {
             let value = e.value();
+            if value.is_empty() {
+                return Bytes::from("");
+            }
             let value_sz = decode_varintu32(value).unwrap();
             Bytes::from(value[varintu32_length(value_sz) as usize..].to_vec())
         })
@@ -238,10 +241,13 @@ impl<'a> Iterator for MemTableIterator<'a> {
         match item_op {
             Some(item) => {
                 let value = item.value();
-                let value_sz = decode_varintu32(value).unwrap();
                 self.key = item.key().internal_key();
+
+                if !value.is_empty() {
+                    let value_sz = decode_varintu32(value).unwrap();
+                    self.value = value.slice(varintu32_length(value_sz) as usize..);
+                }
                 // self.value = value[varintu32_length(value_sz) as usize..].to_vec();
-                self.value = value.slice(varintu32_length(value_sz) as usize..);
                 Some(Entry::new(
                     self.key.clone(),
                     self.value.clone(),
