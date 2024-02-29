@@ -1,11 +1,12 @@
-pub mod cache;
-pub mod compactor;
-pub mod file;
+mod cache;
+mod compactor;
+mod file;
 pub mod lsm;
-pub mod mem_table;
-pub mod sstable;
-pub mod utils;
-pub mod version;
+mod mem_table;
+mod sstable;
+mod utils;
+mod version;
+mod write_batch;
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -65,3 +66,6 @@ impl Options {
         self.clone()
     }
 }
+
+#[cfg(test)]
+mod tests;

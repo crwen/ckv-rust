@@ -21,9 +21,8 @@ use crate::{
         codec::{decode_varintu32, encode_varintu32, varintu32_length},
         Entry, OP_TYPE_PUT,
     },
-    version::{
-        FileMetaData, VersionEdit, {Version, VersionSet},
-    },
+    version::{FileMetaData, Version, VersionEdit, VersionSet},
+    write_batch::WriteBatch,
     Options,
 };
 
@@ -104,38 +103,35 @@ impl LsmInner {
         Ok(mem_inner.imms.len() > 3)
     }
 
-    pub fn delete(&self, key: &[u8], value: &[u8]) -> Result<Option<Task>> {
-        let need_compact = self.try_make_room()?;
-
-        let seq = self.version.add_last_sequence(1);
-        // write wal first
-        self.write_wal(key, value, seq).unwrap();
-        let inner = self.mem_inner.read();
-
-        // let mem_inner = self.mem_inner.read();
-        // write data
-        let e = Entry::new(Bytes::from(key.to_vec()), Bytes::from(value.to_vec()), seq);
-        inner.mem.delete(e);
-
-        let task = need_compact
-            .then_some(Task::Compact)
-            .or(self.version.need_compact().then_some(Task::Major));
-        Ok(task)
+    pub fn delete(&self, key: &[u8]) -> Result<Option<Task>> {
+        let mut batch = WriteBatch::default();
+        batch.delete(key);
+        self.write(&batch)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Task>> {
+        let mut batch = WriteBatch::default();
+        batch.put(key, value);
+        self.write(&batch)
+    }
+
+    pub fn write(&self, batch: &WriteBatch) -> Result<Option<Task>> {
         let need_compact = self.try_make_room()?;
 
         // write wal first
-        let seq = self.version.add_last_sequence(1);
-        self.write_wal(key, value, seq).unwrap();
+        let mut seq = self.version.add_last_sequence(batch.count as u64);
+
+        self.write_batch_wal(batch, seq).unwrap();
 
         let inner = self.mem_inner.read();
 
-        // let mem_inner = self.mem_inner.read();
         // write data
-        let e = Entry::new(Bytes::from(key.to_vec()), Bytes::from(value.to_vec()), seq);
-        inner.mem.put(e);
+        batch.data.iter().for_each(|e| {
+            let mut entry = e.clone();
+            entry.seq = seq;
+            inner.mem.put(entry);
+            seq += 1;
+        });
 
         let task = need_compact
             .then_some(Task::Compact)
@@ -149,8 +145,13 @@ impl LsmInner {
         let seq = self.version.last_sequence();
         // search memtable first
         let result = inner.mem.get(key, seq);
-        if result.is_some() {
-            return Ok((result.map(|val| val.to_vec()), None));
+
+        if let Some(result) = result {
+            if result.is_empty() {
+                // delete case
+                return Ok((None, None));
+            }
+            return Ok((Some(result.to_vec()), None));
         }
         // serach immutable memtable
         for m in inner.imms.iter().rev() {
@@ -166,6 +167,7 @@ impl LsmInner {
         current.derefs();
         Ok((value, task))
     }
+
     fn write_wal(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
         let mut data = Vec::new();
         data.put_u64(seq);
@@ -188,6 +190,25 @@ impl LsmInner {
             Ok(())
         }
     }
+
+    fn write_batch_wal(&self, batch: &WriteBatch, base_seq: u64) -> Result<()> {
+        let mut data = Vec::new();
+        let mut seq = base_seq;
+        batch.data.iter().for_each(|e| {
+            let mut record = vec![];
+            record.put_u64(seq);
+            encode_varintu32(&mut record, e.key.len() as u32);
+            record.put(e.key.clone());
+            encode_varintu32(&mut record, e.value.len() as u32);
+            record.put(e.value.clone());
+            data.push(Bytes::from(record));
+            seq += 1;
+        });
+
+        let inner = self.mem_inner.write();
+        inner.wal.add_recore_batch(&data)
+    }
+
     pub fn compact_mem_table(&self) {
         // write to disk
         // remove files
@@ -398,11 +419,6 @@ impl LsmInner {
                                         },
                                     };
                                 }
-                                // let imm =
-                                //     std::mem::replace(&mut inner.mem, Arc::new(MemTable::new()));
-                                // inner.imms.push_back(imm);
-                                // inner.logs.push_back(fid);
-                                // wal_count += 1;
                                 remove_logs.push(fid);
                             } else {
                                 let path = path_of_file(&self.opt.work_dir, fid, Ext::WAL);
@@ -467,8 +483,14 @@ impl Lsm {
         lsm
     }
 
-    pub fn delete(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let task = self.inner.delete(key, value)?;
+    pub fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
+        let task = self.inner.write(batch)?;
+        self.handle_task(task);
+        Ok(())
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        let task = self.inner.delete(key)?;
         self.handle_task(task);
         Ok(())
     }
@@ -585,7 +607,6 @@ mod lsm_test {
                 .work_dir("work_dir/recovery")
                 .mem_size(1 << 12)
                 .kv_separate_threshold(4);
-            // .kv_separate_threshold(4);
             if std::fs::metadata(&opt.work_dir).is_ok() {
                 std::fs::remove_dir_all(&opt.work_dir).unwrap()
             };
@@ -597,7 +618,6 @@ mod lsm_test {
         // wait to release resource
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        // let opt = Options::default_opt().work_dir("work_dir/recovery");
         let opt = Options::default_opt().work_dir("work_dir/recovery");
         let lsm = Arc::new(Lsm::open(opt));
         //
