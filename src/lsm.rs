@@ -126,10 +126,14 @@ impl LsmInner {
         let inner = self.mem_inner.read();
 
         // write data
-        batch.data.iter().for_each(|e| {
+        batch.data.iter().for_each(|(e, op)| {
             let mut entry = e.clone();
             entry.seq = seq;
-            inner.mem.put(entry);
+            if *op == OP_TYPE_PUT {
+                inner.mem.put(entry);
+            } else {
+                inner.mem.delete(entry)
+            }
             seq += 1;
         });
 
@@ -194,7 +198,7 @@ impl LsmInner {
     fn write_batch_wal(&self, batch: &WriteBatch, base_seq: u64) -> Result<()> {
         let mut data = Vec::new();
         let mut seq = base_seq;
-        batch.data.iter().for_each(|e| {
+        batch.data.iter().for_each(|(e, _)| {
             let mut record = vec![];
             record.put_u64(seq);
             encode_varintu32(&mut record, e.key.len() as u32);
