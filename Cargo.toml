@@ -14,6 +14,7 @@ crossbeam-skiplist = "0.1"
 parking_lot = "0.12"
 thiserror = "1"
 tracing = "0.1"
+lz4_flex = { version = "0.11" }
 
 [dev-dependencies]
 criterion = { version = "0.4", features = ["html_reports"] }
@@ -21,3 +22,10 @@ criterion = { version = "0.4", features = ["html_reports"] }
 [[bench]]
 harness = false
 name = "ckv"
+
+# [[bench]]
+# harness = false
+# name = "rw"
+
+[profile.bench]
+debug = true

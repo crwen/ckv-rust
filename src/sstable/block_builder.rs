@@ -55,6 +55,7 @@ impl BlockBuilder {
         self.data.put_u32(self.entry_offsets.len() as u32);
         let checksum = calculate_checksum(&self.data);
         self.data.put_u64(checksum);
+        self.data = lz4_flex::compress_prepend_size(&self.data);
         &self.data
     }
 }
