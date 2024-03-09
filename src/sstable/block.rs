@@ -73,6 +73,7 @@ pub struct Block {
 
 impl Block {
     pub fn decode(data: &[u8]) -> Self {
+        let data = lz4_flex::decompress_size_prepended(data).unwrap();
         let len = data.len();
         let checksum = (&data[len - SIZEOF_U64..]).get_u64();
         verify_checksum(&data[..len - SIZEOF_U64], checksum).unwrap();
@@ -268,19 +269,12 @@ mod block_test {
         // let block = Block::decode(&buf[..index_offset as usize]);
         let iter = BlockIterator::new(Arc::new(block));
         let mut count = 0;
-        for (_, ele) in iter.enumerate() {
+        iter.enumerate().for_each(|(_, ele)| {
             let e = mem_iter.next().unwrap();
             count += 1;
-            // let e = Entry::new(
-            //     (i as u32).to_be_bytes().to_vec(),
-            //     (i as u32).to_be_bytes().to_vec(),
-            //     i as u64,
-            // );
-
-            // let expected_key = build_internal_key(&e, 0);
             assert_eq!(ele.key, e.key);
             assert_eq!(ele.value[1..], e.value);
-        }
+        });
         assert_eq!(count, 300);
     }
 }

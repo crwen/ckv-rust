@@ -23,6 +23,7 @@ impl Reader {
         let len = (&buf[8..]).get_u32();
         let mut data = vec![0_u8; len as usize];
         self.file.read(&mut data)?;
+        let data = lz4_flex::decompress_size_prepended(&data).unwrap();
         verify_checksum(&data, checksum).unwrap();
         self.offset += 12 + data.len() as u64;
         Ok(data)
@@ -47,6 +48,7 @@ impl RandomReader {
         let mut data = vec![0_u8; len as usize];
         self.file.read(&mut data, offset + 12)?;
 
+        let data = lz4_flex::decompress_size_prepended(&data).unwrap();
         verify_checksum(&data, checksum).unwrap();
         Ok(data)
     }
