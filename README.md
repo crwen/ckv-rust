@@ -1,9 +1,15 @@
 
-[ckv](https://github.com/crwen/ckv) Rust version
 
-Just for learning Rust
+A LSM based Key/Value stroage engine.
 
-- [ ] MemTable
-- [ ] SSTable
-- [ ] Log
-- [ ] Compaction
+- [x] MemTable
+- [x] SSTable
+- [x] Log
+- [x] Compaction
+- [x] Bloom Filter
+- [x] Cache
+- [x] Separating keys from values 
+
+
+reference
+- [LevelDB](https://github.com/google/leveldb)
