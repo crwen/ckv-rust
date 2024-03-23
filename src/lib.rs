@@ -6,7 +6,7 @@ mod mem_table;
 mod sstable;
 mod utils;
 mod version;
-mod write_batch;
+pub mod write_batch;
 
 #[derive(Clone, Debug)]
 pub struct Options {
