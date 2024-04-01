@@ -10,6 +10,9 @@ A LSM based Key/Value stroage engine.
 - [x] Cache
 - [x] Separating keys from values 
 - [x] Write batch
+- [ ] MVCC
+- [ ] GC
+
 
 ### Usage
 
